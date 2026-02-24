@@ -131,7 +131,7 @@ export default function Home() {
     try {
       const r = await fetch('/api/tutorial', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ subtitleUrl, title: video.title, description: video.description }),
+        body: JSON.stringify({ subtitleUrl, title: video.title, description: video.description, videoUrl: video.url }),
       })
       if (!r.ok) { const d = await r.json(); setError(d.error || '教程生成失败'); setTutorialLoading(false); return }
       const reader = r.body?.getReader()
