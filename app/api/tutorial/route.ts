@@ -2,7 +2,9 @@ import { NextRequest } from 'next/server'
 
 export const maxDuration = 60
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || ''
+const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY || ''
+const SILICONFLOW_BASE = 'https://api.siliconflow.cn/v1'
+const MODEL = 'Qwen/Qwen3-8B'
 
 export async function POST(req: NextRequest) {
     try {
@@ -35,7 +37,7 @@ export async function POST(req: NextRequest) {
             )
         }
 
-        // 构建 Gemini prompt
+        // 构建 prompt
         const prompt = `你是一位顶级教学内容设计师。根据以下 B 站视频的字幕内容，生成一篇**结构清晰、适合零基础小白**的图文教程。
 
 ## 视频信息
@@ -58,37 +60,48 @@ ${subtitleText.slice(0, 8000)}
 - 使用 Markdown 格式
 - 用 emoji 让内容更生动
 - 语言亲切，像朋友在教你
-- 避免专业术语，如果必须用则附上解释`
+- 避免专业术语，如果必须用则附上解释
+- 不要输出任何思考过程（<think>标签内容），直接输出教程内容`
 
-        // 调用 Gemini API（流式）
-        const geminiResp = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{ parts: [{ text: prompt }] }],
-                    generationConfig: {
-                        temperature: 0.7,
-                        maxOutputTokens: 4096,
-                    },
-                }),
-            }
-        )
-
-        if (!geminiResp.ok) {
-            const errText = await geminiResp.text()
+        if (!SILICONFLOW_API_KEY) {
             return new Response(
-                JSON.stringify({ error: `Gemini API 错误: ${errText.slice(0, 200)}` }),
+                JSON.stringify({ error: 'AI 服务未配置。请在环境变量中设置 SILICONFLOW_API_KEY。' }),
+                { status: 500, headers: { 'Content-Type': 'application/json' } }
+            )
+        }
+
+        // 调用 SiliconFlow API（OpenAI 兼容格式，SSE 流式）
+        const apiResp = await fetch(`${SILICONFLOW_BASE}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${SILICONFLOW_API_KEY}`,
+            },
+            body: JSON.stringify({
+                model: MODEL,
+                messages: [
+                    { role: 'system', content: '你是一位专业的教学内容设计师，擅长将视频内容转化为通俗易懂的图文教程。直接输出内容，不要输出思考过程。' },
+                    { role: 'user', content: prompt },
+                ],
+                stream: true,
+                temperature: 0.7,
+                max_tokens: 4096,
+            }),
+        })
+
+        if (!apiResp.ok) {
+            const errText = await apiResp.text()
+            return new Response(
+                JSON.stringify({ error: `AI API 错误: ${errText.slice(0, 200)}` }),
                 { status: 502, headers: { 'Content-Type': 'application/json' } }
             )
         }
 
-        // 转发 SSE 流
+        // 转发 SSE 流（OpenAI 格式）
         const encoder = new TextEncoder()
         const readable = new ReadableStream({
             async start(controller) {
-                const reader = geminiResp.body?.getReader()
+                const reader = apiResp.body?.getReader()
                 if (!reader) {
                     controller.close()
                     return
@@ -96,6 +109,7 @@ ${subtitleText.slice(0, 8000)}
 
                 const decoder = new TextDecoder()
                 let buffer = ''
+                let inThinkBlock = false
 
                 try {
                     while (true) {
@@ -112,9 +126,34 @@ ${subtitleText.slice(0, 8000)}
                                 if (jsonStr === '[DONE]') continue
                                 try {
                                     const parsed = JSON.parse(jsonStr)
-                                    const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text
+                                    const text = parsed?.choices?.[0]?.delta?.content
                                     if (text) {
-                                        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text })}\n\n`))
+                                        // 过滤 <think>...</think> 思考过程
+                                        let filtered = text
+                                        if (inThinkBlock) {
+                                            const endIdx = filtered.indexOf('</think>')
+                                            if (endIdx !== -1) {
+                                                filtered = filtered.slice(endIdx + 8)
+                                                inThinkBlock = false
+                                            } else {
+                                                continue // 跳过思考内容
+                                            }
+                                        }
+                                        const startIdx = filtered.indexOf('<think>')
+                                        if (startIdx !== -1) {
+                                            const beforeThink = filtered.slice(0, startIdx)
+                                            const afterStart = filtered.slice(startIdx + 7)
+                                            const endInSame = afterStart.indexOf('</think>')
+                                            if (endInSame !== -1) {
+                                                filtered = beforeThink + afterStart.slice(endInSame + 8)
+                                            } else {
+                                                filtered = beforeThink
+                                                inThinkBlock = true
+                                            }
+                                        }
+                                        if (filtered) {
+                                            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: filtered })}\n\n`))
+                                        }
                                     }
                                 } catch { /* skip malformed JSON */ }
                             }

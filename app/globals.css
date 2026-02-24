@@ -368,3 +368,53 @@ code,
   background: var(--accent-deep);
   color: white;
 }
+
+/* ─────────────── Hero Section ─────────────── */
+.hero-section {
+  position: relative;
+}
+
+/* Mouse-following radial glow */
+.mouse-glow {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(600px circle at var(--mx, 50%) var(--my, 50%),
+      rgba(99, 102, 241, 0.06),
+      transparent 60%);
+  z-index: 0;
+  transition: background 0.15s ease;
+}
+
+/* Film grain / noise texture */
+.hero-section::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  opacity: 0.015;
+  pointer-events: none;
+  z-index: 0;
+  mix-blend-mode: overlay;
+}
+
+/* ─────────────── Search Container ─────────────── */
+.search-container {
+  transition: box-shadow 0.4s ease, border-color 0.4s ease;
+}
+
+.search-container:focus-within {
+  box-shadow:
+    0 0 0 1px rgba(99, 102, 241, 0.15),
+    0 20px 60px -10px rgba(0, 0, 0, 0.5),
+    0 0 80px -20px var(--accent-glow);
+  border-color: rgba(99, 102, 241, 0.2);
+}
+
+/* ─────────────── Expandable Description ─────────────── */
+.line-clamp-3 {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}

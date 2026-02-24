@@ -1,8 +1,8 @@
 'use client'
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
-import { Search, Download, Sparkles, Copy, Check, AlertCircle, Clock, Eye, ThumbsUp, MessageCircle, ArrowDown, Zap, FileText } from 'lucide-react'
+import { Search, Download, Sparkles, Copy, Check, AlertCircle, Clock, Eye, ThumbsUp, MessageCircle, ChevronDown, ChevronUp, Zap, FileText, ExternalLink } from 'lucide-react'
 
 /* ─── Types ─── */
 interface VideoInfo {
@@ -24,6 +24,10 @@ function fmtDur(s: number) {
   const m = Math.floor(s / 60), sec = s % 60
   return `${m}:${sec.toString().padStart(2, '0')}`
 }
+function proxyImg(url: string) {
+  if (!url) return ''
+  return `/api/image-proxy?url=${encodeURIComponent(url)}`
+}
 
 /* ─── Animations ─── */
 const fadeUp = {
@@ -32,7 +36,22 @@ const fadeUp = {
   transition: { duration: 0.8, ease: [0.16, 1, 0.3, 1] },
 }
 const stagger = {
-  animate: { transition: { staggerChildren: 0.1 } },
+  animate: { transition: { staggerChildren: 0.12 } },
+}
+
+/* ─── Mouse Glow Hook ─── */
+function useMouseGlow(ref: React.RefObject<HTMLElement | null>) {
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const handler = (e: MouseEvent) => {
+      const rect = el.getBoundingClientRect()
+      el.style.setProperty('--mx', `${e.clientX - rect.left}px`)
+      el.style.setProperty('--my', `${e.clientY - rect.top}px`)
+    }
+    el.addEventListener('mousemove', handler)
+    return () => el.removeEventListener('mousemove', handler)
+  }, [ref])
 }
 
 export default function Home() {
@@ -46,7 +65,11 @@ export default function Home() {
   const [tutorialLoading, setTutorialLoading] = useState(false)
   const [copied, setCopied] = useState('')
   const [activeTab, setActiveTab] = useState<'download' | 'tutorial'>('download')
+  const [descExpanded, setDescExpanded] = useState(false)
   const tutorialRef = useRef<HTMLDivElement>(null)
+  const heroRef = useRef<HTMLElement>(null)
+
+  useMouseGlow(heroRef)
 
   const copy = useCallback((text: string, label: string) => {
     navigator.clipboard.writeText(text)
@@ -57,7 +80,7 @@ export default function Home() {
   async function analyze() {
     if (!url.trim()) return
     setLoading(true); setError(''); setVideo(null)
-    setTutorialText(''); setDownloadResult(null)
+    setTutorialText(''); setDownloadResult(null); setDescExpanded(false)
     try {
       const r = await fetch('/api/video-info', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -138,55 +161,62 @@ export default function Home() {
   return (
     <main className="relative z-10 min-h-screen">
 
-      {/* ═══════════ HERO ═══════════ */}
-      <section className="relative min-h-[70vh] flex flex-col items-center justify-center px-4 sm:px-6 overflow-hidden">
+      {/* ═══════════ HERO — Full viewport, extreme typography ═══════════ */}
+      <section
+        ref={heroRef}
+        className="hero-section relative min-h-[100vh] flex flex-col items-center justify-center px-4 sm:px-6 overflow-hidden"
+      >
+        {/* Mouse-following glow */}
+        <div className="mouse-glow" />
 
-        {/* Floating accent orb */}
-        <div className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] rounded-full bg-[var(--accent-deep)] opacity-[0.04] blur-[120px] float-slow pointer-events-none" />
+        {/* Floating accent orbs */}
+        <div className="absolute top-[15%] left-[20%] w-[400px] h-[400px] rounded-full bg-[var(--accent-deep)] opacity-[0.03] blur-[150px] float-slow pointer-events-none" />
+        <div className="absolute bottom-[20%] right-[15%] w-[300px] h-[300px] rounded-full bg-[var(--gold)] opacity-[0.02] blur-[120px] float-slow pointer-events-none" style={{ animationDelay: '-4s' }} />
 
-        <motion.div {...stagger} initial="initial" animate="animate" className="text-center max-w-3xl mx-auto">
+        <motion.div {...stagger} initial="initial" animate="animate" className="text-center w-full max-w-4xl mx-auto">
 
-          {/* Badge */}
-          <motion.div {...fadeUp} className="inline-flex items-center gap-2.5 px-5 py-2 rounded-full glass text-xs tracking-wide text-[var(--text-secondary)] mb-8">
-            <span className="relative flex h-2 w-2">
+          {/* Micro badge */}
+          <motion.div {...fadeUp} className="inline-flex items-center gap-2.5 px-5 py-2 rounded-full glass text-[11px] tracking-[0.15em] uppercase text-[var(--text-dim)] mb-10 font-medium">
+            <span className="relative flex h-1.5 w-1.5">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--success)] opacity-75" />
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-[var(--success)]" />
+              <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-[var(--success)]" />
             </span>
-            yt-dlp + Gemini AI 驱动
+            yt-dlp + AI 驱动
           </motion.div>
 
-          {/* Title */}
+          {/* ─── EXTREME Title ─── */}
           <motion.h1
             {...fadeUp}
             transition={{ ...fadeUp.transition, delay: 0.1 }}
-            className="font-display text-5xl sm:text-7xl md:text-8xl font-bold tracking-tight mb-6"
+            className="font-display font-bold tracking-[-0.04em] mb-6 leading-[0.9]"
+            style={{ fontSize: 'clamp(3.5rem, 10vw, 8rem)' }}
           >
-            <span className="bg-clip-text text-transparent bg-gradient-to-b from-white via-white to-[var(--text-secondary)]">
+            <span className="bg-clip-text text-transparent bg-gradient-to-b from-white via-[#e8e8ed] to-[var(--text-dim)]">
               Bili
             </span>
-            <span className="bg-clip-text text-transparent bg-gradient-to-b from-[var(--accent-bright)] to-[var(--accent-deep)]">
+            <span className="bg-clip-text text-transparent bg-gradient-to-b from-[var(--accent-bright)] via-[var(--accent)] to-[var(--accent-deep)]">
               Helper
             </span>
           </motion.h1>
 
-          {/* Subtitle */}
+          {/* Subtitle — restrained, high contrast with title */}
           <motion.p
             {...fadeUp}
             transition={{ ...fadeUp.transition, delay: 0.2 }}
-            className="text-lg sm:text-xl text-[var(--text-secondary)] max-w-lg mx-auto mb-12 leading-relaxed"
+            className="text-base sm:text-lg text-[var(--text-dim)] max-w-md mx-auto mb-14 leading-relaxed font-light tracking-wide"
           >
-            粘贴链接，解析一切。
-            <br className="hidden sm:block" />
-            <span className="text-[var(--text-dim)]">AI 智能生成小白教程 · 一键下载到本地</span>
+            粘贴链接，<span className="text-[var(--text-secondary)]">解码一切</span>。
+            <br />
+            <span className="text-[0.8rem]">AI 智能教程 · 离线下载 · 零门槛</span>
           </motion.p>
 
-          {/* ─── Search Bar ─── */}
+          {/* ─── Search Bar — Elevated glass terminal ─── */}
           <motion.div
             {...fadeUp}
             transition={{ ...fadeUp.transition, delay: 0.3 }}
             className="w-full max-w-2xl mx-auto"
           >
-            <div className="glass-elevated rounded-2xl p-2">
+            <div className="search-container glass-elevated rounded-2xl p-2">
               <div className="flex gap-2">
                 <div className="relative flex-1">
                   <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-[var(--text-dim)]" />
@@ -194,16 +224,16 @@ export default function Home() {
                     type="text" value={url} onChange={e => setUrl(e.target.value)}
                     onKeyDown={e => e.key === 'Enter' && analyze()}
                     placeholder="粘贴 B 站或 YouTube 视频链接..."
-                    className="w-full bg-transparent pl-12 pr-4 py-4 sm:py-5 text-[var(--text-primary)] placeholder-[var(--text-dim)] outline-none text-base sm:text-lg font-light"
+                    className="w-full bg-transparent pl-12 pr-4 py-4 sm:py-5 text-[var(--text-primary)] placeholder-[var(--text-dim)] outline-none text-base font-light tracking-wide"
                   />
                 </div>
                 <button
                   onClick={analyze} disabled={loading || !url.trim()}
-                  className="btn-primary disabled:opacity-30 disabled:cursor-not-allowed disabled:transform-none px-6 sm:px-10 py-4 sm:py-5 text-base font-semibold whitespace-nowrap rounded-xl"
+                  className="btn-primary disabled:opacity-30 disabled:cursor-not-allowed disabled:transform-none px-8 sm:px-10 py-4 sm:py-5 text-sm font-semibold whitespace-nowrap rounded-xl tracking-wide uppercase"
                 >
                   {loading ? (
                     <span className="flex items-center gap-2">
-                      <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                      <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
                       解析中
                     </span>
                   ) : '解析'}
@@ -211,35 +241,24 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Trust signals */}
+            {/* Feature pills — asymmetric */}
             <motion.div
               {...fadeUp}
               transition={{ ...fadeUp.transition, delay: 0.5 }}
-              className="flex items-center justify-center gap-6 mt-6 text-xs text-[var(--text-dim)]"
+              className="flex items-center justify-center gap-8 mt-8 text-[11px] tracking-[0.12em] uppercase text-[var(--text-dim)] font-medium"
             >
-              <span className="flex items-center gap-1.5"><Zap className="w-3.5 h-3.5" />秒级解析</span>
-              <span className="flex items-center gap-1.5"><Download className="w-3.5 h-3.5" />离线下载</span>
-              <span className="flex items-center gap-1.5"><Sparkles className="w-3.5 h-3.5" />AI 教程</span>
+              <span className="flex items-center gap-2"><Zap className="w-3 h-3 text-[var(--accent)]" />秒级解析</span>
+              <span className="w-[1px] h-3 bg-[var(--border)]" />
+              <span className="flex items-center gap-2"><Download className="w-3 h-3 text-[var(--accent)]" />离线下载</span>
+              <span className="w-[1px] h-3 bg-[var(--border)]" />
+              <span className="flex items-center gap-2"><Sparkles className="w-3 h-3 text-[var(--gold)]" />AI 教程</span>
             </motion.div>
           </motion.div>
         </motion.div>
-
-        {/* Scroll indicator */}
-        <AnimatePresence>
-          {!video && (
-            <motion.div
-              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-              transition={{ delay: 1.5 }}
-              className="absolute bottom-8 left-1/2 -translate-x-1/2"
-            >
-              <ArrowDown className="w-4 h-4 text-[var(--text-dim)] animate-bounce" />
-            </motion.div>
-          )}
-        </AnimatePresence>
       </section>
 
-      {/* ═══════════ CONTENT ═══════════ */}
-      <div className="max-w-3xl mx-auto px-4 sm:px-6 pb-24">
+      {/* ═══════════ CONTENT AREA ═══════════ */}
+      <div className="max-w-4xl mx-auto px-4 sm:px-6 pb-32">
 
         {/* Error */}
         <AnimatePresence>
@@ -248,11 +267,12 @@ export default function Home() {
               className="flex items-center gap-3 glass rounded-xl p-4 mb-6 border-[var(--danger)]/20 border">
               <AlertCircle className="w-5 h-5 text-[var(--danger)] shrink-0" />
               <span className="text-[var(--danger)] text-sm">{error}</span>
+              <button onClick={() => setError('')} className="ml-auto text-[var(--text-dim)] hover:text-white text-xs">✕</button>
             </motion.div>
           )}
         </AnimatePresence>
 
-        {/* ═══════════ VIDEO CARD ═══════════ */}
+        {/* ═══════════ VIDEO CARD — Asymmetric Bento ═══════════ */}
         <AnimatePresence>
           {video && (
             <motion.div
@@ -261,21 +281,25 @@ export default function Home() {
               transition={{ duration: 0.7, ease: [0.16, 1, 0.3, 1] }}
               className="space-y-4"
             >
-              {/* Video Info — Bento Card */}
+              {/* Video Info — Cinematic card */}
               <div className="glass-elevated rounded-2xl overflow-hidden">
                 {video.thumbnail && (
-                  <div className="relative h-48 sm:h-64 overflow-hidden">
+                  <div className="relative h-48 sm:h-72 overflow-hidden">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={video.thumbnail} alt="" className="w-full h-full object-cover" />
-                    <div className="absolute inset-0 bg-gradient-to-t from-[var(--bg-deep)] via-[var(--bg-deep)]/40 to-transparent" />
+                    <img
+                      src={proxyImg(video.thumbnail)}
+                      alt={video.title}
+                      className="w-full h-full object-cover"
+                    />
+                    <div className="absolute inset-0 bg-gradient-to-t from-[var(--bg-deep)] via-[var(--bg-deep)]/50 to-transparent" />
 
                     {/* Overlay pills */}
                     <div className="absolute bottom-4 left-4 right-4 flex items-end justify-between">
-                      <span className="text-[10px] font-semibold uppercase tracking-widest bg-[var(--accent-deep)]/90 backdrop-blur-sm px-3 py-1.5 rounded-lg text-white/90">
+                      <span className="text-[10px] font-semibold uppercase tracking-[0.2em] bg-[var(--accent-deep)]/90 backdrop-blur-sm px-3 py-1.5 rounded-lg text-white/90">
                         {video.platform === 'bilibili' ? 'Bilibili' : 'YouTube'}
                       </span>
                       {video.duration && (
-                        <div className="flex items-center gap-1.5 bg-black/60 backdrop-blur-sm px-3 py-1.5 rounded-lg text-sm text-white/80">
+                        <div className="flex items-center gap-1.5 bg-black/60 backdrop-blur-sm px-3 py-1.5 rounded-lg text-sm text-white/80 font-mono">
                           <Clock className="w-3.5 h-3.5" />
                           {fmtDur(video.duration)}
                         </div>
@@ -285,32 +309,51 @@ export default function Home() {
                 )}
 
                 <div className="p-6 sm:p-8">
-                  <h2 className="font-display text-xl sm:text-2xl font-bold leading-snug mb-4">{video.title}</h2>
+                  <h2 className="font-display text-xl sm:text-2xl font-bold leading-snug mb-4 tracking-tight">{video.title}</h2>
 
                   <div className="flex items-center gap-3 mb-5">
                     {video.avatar && (
                       // eslint-disable-next-line @next/next/no-img-element
-                      <img src={video.avatar} alt="" className="w-9 h-9 rounded-full ring-2 ring-[var(--border)]" />
+                      <img src={proxyImg(video.avatar)} alt="" className="w-9 h-9 rounded-full ring-2 ring-[var(--border)]" />
                     )}
                     <span className="text-sm font-medium text-[var(--text-secondary)]">{video.uploader}</span>
+                    {video.url && (
+                      <a href={video.url} target="_blank" rel="noopener noreferrer"
+                        className="ml-auto text-[var(--text-dim)] hover:text-[var(--accent)] transition-colors">
+                        <ExternalLink className="w-4 h-4" />
+                      </a>
+                    )}
                   </div>
 
                   {/* Stats row */}
                   {video.views !== undefined && (
-                    <div className="flex flex-wrap gap-2">
+                    <div className="flex flex-wrap gap-2 mb-4">
                       <span className="stat-pill"><Eye className="w-3.5 h-3.5" />{fmt(video.views)}</span>
                       {video.likes !== undefined && <span className="stat-pill"><ThumbsUp className="w-3.5 h-3.5" />{fmt(video.likes)}</span>}
                       {video.danmakus !== undefined && <span className="stat-pill"><MessageCircle className="w-3.5 h-3.5" />{fmt(video.danmakus)}</span>}
                     </div>
                   )}
 
+                  {/* Description — Expandable */}
                   {video.description && (
-                    <p className="mt-5 text-sm text-[var(--text-dim)] line-clamp-2 leading-relaxed">{video.description}</p>
+                    <div className="mt-4">
+                      <p className={`text-sm text-[var(--text-dim)] leading-relaxed whitespace-pre-wrap ${!descExpanded ? 'line-clamp-3' : ''}`}>
+                        {video.description}
+                      </p>
+                      {video.description.length > 100 && (
+                        <button
+                          onClick={() => setDescExpanded(!descExpanded)}
+                          className="flex items-center gap-1 mt-2 text-xs text-[var(--accent)] hover:text-[var(--accent-bright)] transition-colors font-medium"
+                        >
+                          {descExpanded ? <><ChevronUp className="w-3 h-3" />收起</> : <><ChevronDown className="w-3 h-3" />展开全部</>}
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
               </div>
 
-              {/* ─── Action Bento Grid ─── */}
+              {/* ─── Action Bento Grid — Asymmetric 2-col ─── */}
               <div className="grid grid-cols-2 gap-3">
                 <button
                   onClick={downloadVideo} disabled={downloading || !video.bvid}
@@ -405,8 +448,8 @@ export default function Home() {
                       key={tab.key}
                       onClick={() => setActiveTab(tab.key)}
                       className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-lg text-sm font-medium transition-all ${activeTab === tab.key
-                          ? 'bg-[var(--bg-glass-hover)] text-[var(--text-primary)] shadow-sm'
-                          : 'text-[var(--text-dim)] hover:text-[var(--text-secondary)]'
+                        ? 'bg-[var(--bg-glass-hover)] text-[var(--text-primary)] shadow-sm'
+                        : 'text-[var(--text-dim)] hover:text-[var(--text-secondary)]'
                         }`}
                     >
                       <tab.icon className="w-4 h-4" />
@@ -476,16 +519,16 @@ export default function Home() {
         </AnimatePresence>
       </div>
 
-      {/* ═══════════ FOOTER ═══════════ */}
+      {/* ═══════════ FOOTER — Minimal, structured ═══════════ */}
       <footer className="relative z-10 border-t border-[var(--border)]">
-        <div className="max-w-3xl mx-auto px-4 sm:px-6 py-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-[var(--text-dim)]">
-          <p className="flex items-center gap-2">
+        <div className="max-w-4xl mx-auto px-4 sm:px-6 py-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-[11px] tracking-[0.1em] uppercase text-[var(--text-dim)]">
+          <p className="flex items-center gap-3">
             Powered by{' '}
             <a href="https://github.com/yt-dlp/yt-dlp" className="text-[var(--accent)] hover:text-[var(--accent-bright)] transition-colors" target="_blank" rel="noopener noreferrer">yt-dlp</a>
             <span className="text-[var(--border)]">·</span> B 站 API
-            <span className="text-[var(--border)]">·</span> Gemini AI
+            <span className="text-[var(--border)]">·</span> Qwen AI
           </p>
-          <p className="text-[var(--text-dim)]">仅供学习交流使用</p>
+          <p>仅供学习交流使用</p>
         </div>
       </footer>
     </main>
