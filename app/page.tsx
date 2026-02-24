@@ -1,34 +1,27 @@
 'use client'
-import { useState } from 'react'
+import { useState, useRef, useCallback } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
+import ReactMarkdown from 'react-markdown'
+import { Search, Download, Sparkles, Copy, Check, AlertCircle, Play, Clock, Eye, ThumbsUp, MessageCircle } from 'lucide-react'
 
 interface VideoInfo {
-  platform: string
-  title: string
-  uploader: string
-  avatar?: string
-  duration?: number
-  views?: number
-  likes?: number
-  coins?: number
-  favorites?: number
-  danmakus?: number
-  description?: string
-  thumbnail?: string
-  bvid?: string
-  aid?: number
-  url: string
+  platform: string; title: string; uploader: string; avatar?: string
+  duration?: number; views?: number; likes?: number; coins?: number
+  favorites?: number; danmakus?: number; description?: string
+  thumbnail?: string; bvid?: string; cid?: number; aid?: number
+  url: string; subtitles: { lan: string; lan_doc: string; subtitle_url: string }[]
+  hasSubtitles: boolean
 }
 
-function formatDuration(s: number) {
-  const m = Math.floor(s / 60)
-  const sec = s % 60
-  return `${m}:${sec.toString().padStart(2, '0')}`
-}
-
-function formatNumber(n: number) {
-  if (n >= 100000000) return (n / 100000000).toFixed(1) + '亿'
-  if (n >= 10000) return (n / 10000).toFixed(1) + '万'
+function fmt(n: number) {
+  if (n >= 1e8) return (n / 1e8).toFixed(1) + '亿'
+  if (n >= 1e4) return (n / 1e4).toFixed(1) + '万'
   return n.toLocaleString()
+}
+
+function fmtDur(s: number) {
+  const m = Math.floor(s / 60), sec = s % 60
+  return `${m}:${sec.toString().padStart(2, '0')}`
 }
 
 export default function Home() {
@@ -36,261 +29,401 @@ export default function Home() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [video, setVideo] = useState<VideoInfo | null>(null)
-  const [tab, setTab] = useState<'download' | 'tutorial'>('download')
+  const [downloading, setDownloading] = useState(false)
+  const [downloadResult, setDownloadResult] = useState<{ mode: string; command?: string; message?: string } | null>(null)
+  const [tutorialText, setTutorialText] = useState('')
+  const [tutorialLoading, setTutorialLoading] = useState(false)
   const [copied, setCopied] = useState('')
+  const [activeTab, setActiveTab] = useState<'download' | 'tutorial'>('download')
+  const tutorialRef = useRef<HTMLDivElement>(null)
 
-  async function handleAnalyze() {
-    if (!url.trim()) return
-    setLoading(true)
-    setError('')
-    setVideo(null)
-    try {
-      const resp = await fetch('/api/video-info', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url.trim() }),
-      })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error || '解析失败')
-      setVideo(data)
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : '未知错误')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  function copyToClipboard(text: string, label: string) {
+  const copy = useCallback((text: string, label: string) => {
     navigator.clipboard.writeText(text)
     setCopied(label)
     setTimeout(() => setCopied(''), 2000)
+  }, [])
+
+  async function analyze() {
+    if (!url.trim()) return
+    setLoading(true); setError(''); setVideo(null)
+    setTutorialText(''); setDownloadResult(null)
+    try {
+      const r = await fetch('/api/video-info', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: url.trim() }),
+      })
+      const d = await r.json()
+      if (!r.ok) throw new Error(d.error)
+      setVideo(d)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '解析失败')
+    } finally { setLoading(false) }
   }
 
-  function getDownloadCommands(v: VideoInfo) {
-    const u = v.url
-    return [
-      { label: '🎬 最高画质下载', cmd: `yt-dlp -f "bestvideo+bestaudio" --merge-output-format mp4 "${u}"` },
-      { label: '🎵 仅下载音频 (MP3)', cmd: `yt-dlp -x --audio-format mp3 "${u}"` },
-      { label: '📋 查看所有画质', cmd: `yt-dlp -F "${u}"` },
-      ...(v.platform === 'bilibili' ? [
-        { label: '💬 下载字幕', cmd: `yt-dlp --write-sub --sub-lang zh-CN --skip-download "${u}"` },
-        { label: '🔑 大会员画质下载', cmd: `yt-dlp --cookies-from-browser chrome -f "bestvideo+bestaudio" "${u}"` },
-      ] : []),
-      { label: '📊 获取元数据 (JSON)', cmd: `yt-dlp --dump-json "${u}"` },
-    ]
+  async function downloadVideo() {
+    if (!video?.bvid || !video?.cid) return
+    setDownloading(true); setDownloadResult(null)
+    try {
+      const r = await fetch('/api/download', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bvid: video.bvid, cid: video.cid }),
+      })
+      const contentType = r.headers.get('content-type') || ''
+      if (contentType.includes('video')) {
+        const blob = await r.blob()
+        const a = document.createElement('a')
+        a.href = URL.createObjectURL(blob)
+        a.download = `${video.title}.mp4`
+        a.click()
+        URL.revokeObjectURL(a.href)
+        setDownloadResult({ mode: 'success', message: '下载完成！检查你的下载文件夹 🎉' })
+      } else {
+        const d = await r.json()
+        if (d.mode === 'fallback') {
+          setDownloadResult(d)
+        } else {
+          setDownloadResult({ mode: 'error', message: d.error || '下载失败' })
+        }
+      }
+    } catch (e: unknown) {
+      setDownloadResult({ mode: 'error', message: e instanceof Error ? e.message : '下载失败' })
+    } finally { setDownloading(false) }
   }
 
-  function getTutorialText(v: VideoInfo) {
-    const platform = v.platform === 'bilibili' ? 'B 站' : 'YouTube'
-    const lines = [
-      `📺 ${v.title}`,
-      '',
-      `视频信息`,
-      `• ${platform} UP主/频道: ${v.uploader}`,
-    ]
-    if (v.duration) lines.push(`• 时长: ${formatDuration(v.duration)}`)
-    if (v.views) lines.push(`• 播放量: ${formatNumber(v.views)}`)
-    lines.push(`• 链接: ${v.url}`)
-    if (v.description) {
-      lines.push('', `简介`, v.description.slice(0, 200))
-    }
-    lines.push(
-      '', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-      '', '🔰 下载教程（零基础 3 步搞定）',
-      '',
-      '第 1 步：安装工具',
-      '',
-      'Mac 用户:',
-      '  brew install yt-dlp ffmpeg',
-      '',
-      'Windows 用户:',
-      '  1. 下载 yt-dlp: https://github.com/yt-dlp/yt-dlp/releases',
-      '  2. 下载 ffmpeg: https://ffmpeg.org/download.html',
-      '  3. 解压到同一目录，添加到 PATH',
-      '',
-      '第 2 步：打开终端，粘贴命令',
-      '',
-      '# 下载最高画质',
-      `yt-dlp -f "bestvideo+bestaudio" --merge-output-format mp4 "${v.url}"`,
-      '',
-      '# 只要音频',
-      `yt-dlp -x --audio-format mp3 "${v.url}"`,
-      '',
-      '第 3 步：播放',
-      '双击下载的文件即可 🎉',
-      '',
-      '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-      '',
-      '⚠️ 常见问题',
-      '',
-      '报错"需要登录"？',
-      `  yt-dlp --cookies-from-browser chrome "${v.url}"`,
-      '',
-      '下载很慢？',
-      `  yt-dlp --limit-rate 500K "${v.url}"`,
-      '',
-      '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-      '由 BiliHelper 自动生成',
-    )
-    return lines.join('\n')
+  async function generateTutorial() {
+    if (!video) return
+    setTutorialLoading(true); setTutorialText(''); setActiveTab('tutorial')
+
+    const subtitleUrl = video.subtitles?.[0]?.subtitle_url || ''
+    try {
+      const r = await fetch('/api/tutorial', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subtitleUrl, title: video.title, description: video.description,
+        }),
+      })
+      if (!r.ok) {
+        const d = await r.json()
+        setError(d.error || '教程生成失败')
+        setTutorialLoading(false)
+        return
+      }
+      const reader = r.body?.getReader()
+      if (!reader) return
+      const decoder = new TextDecoder()
+      let buf = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop() || ''
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const payload = line.slice(6).trim()
+            if (payload === '[DONE]') continue
+            try {
+              const { text } = JSON.parse(payload)
+              if (text) setTutorialText(prev => prev + text)
+            } catch { /* skip */ }
+          }
+        }
+        tutorialRef.current?.scrollTo({ top: tutorialRef.current.scrollHeight, behavior: 'smooth' })
+      }
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '教程生成失败')
+    } finally { setTutorialLoading(false) }
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 text-white">
-      <div className="max-w-3xl mx-auto px-4 py-16">
-        {/* Header */}
-        <div className="text-center mb-12">
-          <h1 className="text-5xl font-bold mb-3">
-            <span className="text-white">Bili</span>
-            <span className="text-pink-400">Helper</span>
+    <main className="relative z-10 min-h-screen">
+      <div className="max-w-4xl mx-auto px-4 sm:px-6 py-12 sm:py-20">
+
+        {/* Hero */}
+        <motion.div
+          initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
+          className="text-center mb-16"
+        >
+          <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full glass text-xs text-[var(--text-secondary)] mb-6">
+            <span className="w-1.5 h-1.5 rounded-full bg-[var(--success)] animate-pulse" />
+            由 yt-dlp + Gemini AI 驱动
+          </div>
+          <h1 className="text-5xl sm:text-7xl font-black tracking-tight mb-4">
+            Bili<span className="text-[var(--accent)]">Helper</span>
           </h1>
-          <p className="text-gray-400 text-lg">真正能用的视频信息查询 + 小白攻略生成器</p>
-        </div>
+          <p className="text-lg text-[var(--text-secondary)] max-w-md mx-auto">
+            粘贴视频链接，一键下载到本地 · AI 智能解析生成小白教程
+          </p>
+        </motion.div>
 
         {/* Input */}
-        <div className="flex gap-3 mb-8">
-          <input
-            type="text"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleAnalyze()}
-            placeholder="粘贴 B 站或 YouTube 视频链接..."
-            className="flex-1 bg-gray-800/60 border border-gray-700 rounded-xl px-5 py-4 text-white placeholder-gray-500 focus:outline-none focus:border-pink-500 focus:ring-1 focus:ring-pink-500 transition-all"
-          />
-          <button
-            onClick={handleAnalyze}
-            disabled={loading || !url.trim()}
-            className="px-8 py-4 bg-gradient-to-r from-pink-500 to-rose-500 rounded-xl font-semibold hover:from-pink-600 hover:to-rose-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all whitespace-nowrap"
-          >
-            {loading ? (
-              <span className="flex items-center gap-2">
-                <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
-                解析中
-              </span>
-            ) : '解析 🔍'}
-          </button>
-        </div>
+        <motion.div
+          initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.2, duration: 0.6 }}
+          className="glass rounded-2xl p-2 mb-8"
+        >
+          <div className="flex gap-2">
+            <div className="relative flex-1">
+              <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-[var(--text-dim)]" />
+              <input
+                type="text" value={url} onChange={e => setUrl(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && analyze()}
+                placeholder="粘贴 B 站或 YouTube 视频链接..."
+                className="w-full bg-transparent pl-12 pr-4 py-4 text-[var(--text-primary)] placeholder-[var(--text-dim)] outline-none text-lg"
+              />
+            </div>
+            <button
+              onClick={analyze} disabled={loading || !url.trim()}
+              className="btn-glow bg-[var(--accent)] hover:bg-[var(--accent)]/90 disabled:opacity-30 disabled:cursor-not-allowed px-8 py-4 rounded-xl font-semibold text-white transition-all whitespace-nowrap"
+            >
+              {loading ? (
+                <span className="flex items-center gap-2">
+                  <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                  解析中
+                </span>
+              ) : '解析'}
+            </button>
+          </div>
+        </motion.div>
 
         {/* Error */}
-        {error && (
-          <div className="bg-red-900/30 border border-red-700 rounded-xl p-4 mb-6 text-red-300">
-            ❌ {error}
-          </div>
-        )}
+        <AnimatePresence>
+          {error && (
+            <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+              className="flex items-center gap-3 glass rounded-xl p-4 mb-6 border-[var(--accent)]/30 border">
+              <AlertCircle className="w-5 h-5 text-[var(--accent)] shrink-0" />
+              <span className="text-[var(--accent)] text-sm">{error}</span>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
-        {/* Video Info Card */}
-        {video && (
-          <div className="space-y-6">
-            <div className="bg-gray-800/40 border border-gray-700/50 rounded-2xl overflow-hidden">
-              {video.thumbnail && (
-                <div className="relative">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={video.thumbnail} alt={video.title} className="w-full h-48 object-cover" />
-                  {video.duration && (
-                    <span className="absolute bottom-3 right-3 bg-black/80 text-white text-sm px-2 py-1 rounded">
-                      {formatDuration(video.duration)}
-                    </span>
-                  )}
-                </div>
-              )}
-              <div className="p-6">
-                <h2 className="text-xl font-bold mb-2">{video.title}</h2>
-                <div className="flex items-center gap-3 text-gray-400 mb-4">
-                  {video.avatar && (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img src={video.avatar} alt="" className="w-8 h-8 rounded-full" />
-                  )}
-                  <span className="font-medium">{video.uploader}</span>
-                  <span className="text-xs bg-gray-700 px-2 py-0.5 rounded">
-                    {video.platform === 'bilibili' ? 'B站' : 'YouTube'}
-                  </span>
-                </div>
-                {video.views !== undefined && (
-                  <div className="flex gap-4 text-sm text-gray-500">
-                    <span>▶ {formatNumber(video.views)}</span>
-                    {video.likes !== undefined && <span>👍 {formatNumber(video.likes)}</span>}
-                    {video.coins !== undefined && <span>🪙 {formatNumber(video.coins)}</span>}
-                    {video.danmakus !== undefined && <span>💬 {formatNumber(video.danmakus)}</span>}
-                  </div>
-                )}
-                {video.description && (
-                  <p className="mt-4 text-sm text-gray-400 line-clamp-3">{video.description}</p>
-                )}
-              </div>
-            </div>
-
-            {/* Tabs */}
-            <div className="flex gap-2">
-              <button
-                onClick={() => setTab('download')}
-                className={`flex-1 py-3 rounded-xl font-medium transition-all ${tab === 'download'
-                    ? 'bg-pink-500/20 text-pink-400 border border-pink-500/50'
-                    : 'bg-gray-800/40 text-gray-400 border border-gray-700/50 hover:bg-gray-800/60'
-                  }`}
-              >
-                📥 下载指令
-              </button>
-              <button
-                onClick={() => setTab('tutorial')}
-                className={`flex-1 py-3 rounded-xl font-medium transition-all ${tab === 'tutorial'
-                    ? 'bg-pink-500/20 text-pink-400 border border-pink-500/50'
-                    : 'bg-gray-800/40 text-gray-400 border border-gray-700/50 hover:bg-gray-800/60'
-                  }`}
-              >
-                📖 小白攻略
-              </button>
-            </div>
-
-            {/* Download Commands */}
-            {tab === 'download' && (
-              <div className="space-y-3">
-                {getDownloadCommands(video).map((item) => (
-                  <div key={item.label} className="bg-gray-800/40 border border-gray-700/50 rounded-xl p-4">
-                    <div className="flex justify-between items-center mb-2">
-                      <span className="text-sm font-medium text-gray-300">{item.label}</span>
-                      <button
-                        onClick={() => copyToClipboard(item.cmd, item.label)}
-                        className="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded-lg transition-colors"
-                      >
-                        {copied === item.label ? '✅ 已复制' : '📋 复制'}
-                      </button>
+        {/* Video Card */}
+        <AnimatePresence>
+          {video && (
+            <motion.div
+              initial={{ opacity: 0, y: 30, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
+              className="space-y-6"
+            >
+              {/* Video Info */}
+              <div className="glass rounded-2xl overflow-hidden">
+                {video.thumbnail && (
+                  <div className="relative h-56 sm:h-72 overflow-hidden">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={video.thumbnail} alt="" className="w-full h-full object-cover" />
+                    <div className="absolute inset-0 bg-gradient-to-t from-[var(--bg-deep)] via-transparent to-transparent" />
+                    {video.duration && (
+                      <div className="absolute bottom-4 right-4 flex items-center gap-1.5 bg-black/70 backdrop-blur-sm px-3 py-1.5 rounded-lg text-sm">
+                        <Clock className="w-3.5 h-3.5" />
+                        {fmtDur(video.duration)}
+                      </div>
+                    )}
+                    <div className="absolute bottom-4 left-4">
+                      <span className="text-xs font-medium bg-[var(--accent)]/90 px-2.5 py-1 rounded-md">
+                        {video.platform === 'bilibili' ? 'Bilibili' : 'YouTube'}
+                      </span>
                     </div>
-                    <code className="block text-xs text-green-400 bg-black/30 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap break-all">
-                      {item.cmd}
-                    </code>
                   </div>
-                ))}
-                <div className="bg-amber-900/20 border border-amber-700/40 rounded-xl p-4 text-sm text-amber-300">
-                  💡 使用前请先安装 yt-dlp：<code className="bg-black/30 px-2 py-0.5 rounded">brew install yt-dlp ffmpeg</code>
+                )}
+                <div className="p-6">
+                  <h2 className="text-xl sm:text-2xl font-bold mb-3 leading-snug">{video.title}</h2>
+                  <div className="flex items-center gap-3 mb-4">
+                    {video.avatar && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={video.avatar} alt="" className="w-10 h-10 rounded-full ring-2 ring-[var(--border)]" />
+                    )}
+                    <span className="font-medium text-[var(--text-secondary)]">{video.uploader}</span>
+                  </div>
+                  {video.views !== undefined && (
+                    <div className="flex flex-wrap gap-x-5 gap-y-2 text-sm text-[var(--text-dim)]">
+                      <span className="flex items-center gap-1.5"><Eye className="w-4 h-4" />{fmt(video.views)}</span>
+                      {video.likes !== undefined && <span className="flex items-center gap-1.5"><ThumbsUp className="w-4 h-4" />{fmt(video.likes)}</span>}
+                      {video.danmakus !== undefined && <span className="flex items-center gap-1.5"><MessageCircle className="w-4 h-4" />{fmt(video.danmakus)}</span>}
+                    </div>
+                  )}
+                  {video.description && (
+                    <p className="mt-4 text-sm text-[var(--text-dim)] line-clamp-2">{video.description}</p>
+                  )}
                 </div>
               </div>
-            )}
 
-            {/* Tutorial */}
-            {tab === 'tutorial' && (
-              <div className="bg-gray-800/40 border border-gray-700/50 rounded-xl p-6">
-                <div className="flex justify-between items-center mb-4">
-                  <h3 className="font-bold text-lg">📖 下载攻略</h3>
+              {/* Action Buttons */}
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  onClick={downloadVideo} disabled={downloading || !video.bvid}
+                  className="btn-glow glass rounded-xl p-5 text-left group hover:border-[var(--accent)]/30 transition-all disabled:opacity-40"
+                >
+                  <div className="flex items-center gap-3 mb-2">
+                    <div className="w-10 h-10 rounded-lg bg-[var(--accent)]/10 flex items-center justify-center">
+                      <Download className="w-5 h-5 text-[var(--accent)]" />
+                    </div>
+                    <span className="font-semibold">
+                      {downloading ? '下载中...' : '下载视频'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-[var(--text-dim)]">
+                    {video.bvid ? '直接下载 MP4 到本地' : '仅支持 B 站视频'}
+                  </p>
+                  {downloading && (
+                    <div className="mt-3 h-1 bg-[var(--bg-glass)] rounded-full overflow-hidden">
+                      <div className="h-full bg-[var(--accent)] rounded-full shimmer" style={{ width: '100%' }} />
+                    </div>
+                  )}
+                </button>
+                <button
+                  onClick={generateTutorial} disabled={tutorialLoading}
+                  className="btn-glow glass rounded-xl p-5 text-left group hover:border-[var(--gold)]/30 transition-all disabled:opacity-40"
+                >
+                  <div className="flex items-center gap-3 mb-2">
+                    <div className="w-10 h-10 rounded-lg bg-[var(--gold)]/10 flex items-center justify-center">
+                      <Sparkles className="w-5 h-5 text-[var(--gold)]" />
+                    </div>
+                    <span className="font-semibold">
+                      {tutorialLoading ? 'AI 生成中...' : 'AI 生成教程'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-[var(--text-dim)]">
+                    {video.hasSubtitles ? '从字幕提取知识点' : '从描述分析内容'}
+                  </p>
+                  {tutorialLoading && (
+                    <div className="mt-3 h-1 bg-[var(--bg-glass)] rounded-full overflow-hidden">
+                      <div className="h-full bg-[var(--gold)] rounded-full shimmer" style={{ width: '100%' }} />
+                    </div>
+                  )}
+                </button>
+              </div>
+
+              {/* Download Result */}
+              <AnimatePresence>
+                {downloadResult && (
+                  <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+                    className="glass rounded-xl p-5">
+                    {downloadResult.mode === 'success' && (
+                      <div className="flex items-center gap-3 text-[var(--success)]">
+                        <Check className="w-5 h-5" />
+                        <span className="font-medium">{downloadResult.message}</span>
+                      </div>
+                    )}
+                    {downloadResult.mode === 'fallback' && (
+                      <div>
+                        <p className="text-sm text-[var(--text-secondary)] mb-3">
+                          ⚠️ {downloadResult.message}
+                        </p>
+                        <div className="relative">
+                          <code className="block text-xs text-[#86efac] bg-black/40 rounded-lg p-4 pr-16 overflow-x-auto">
+                            {downloadResult.command}
+                          </code>
+                          <button
+                            onClick={() => copy(downloadResult.command || '', 'dl-cmd')}
+                            className="absolute top-3 right-3 text-xs bg-white/5 hover:bg-white/10 px-2.5 py-1 rounded-md transition-colors"
+                          >
+                            {copied === 'dl-cmd' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {downloadResult.mode === 'error' && (
+                      <div className="flex items-center gap-3 text-[var(--accent)]">
+                        <AlertCircle className="w-5 h-5" />
+                        <span className="text-sm">{downloadResult.message}</span>
+                      </div>
+                    )}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Tabs */}
+              {(tutorialText || activeTab === 'download') && (
+                <div className="flex gap-1 p-1 glass rounded-xl">
                   <button
-                    onClick={() => copyToClipboard(getTutorialText(video), 'tutorial')}
-                    className="text-sm bg-pink-500/20 text-pink-400 hover:bg-pink-500/30 px-4 py-2 rounded-lg transition-colors"
+                    onClick={() => setActiveTab('download')}
+                    className={`flex-1 py-2.5 rounded-lg text-sm font-medium transition-all ${activeTab === 'download'
+                        ? 'bg-white/5 text-[var(--text-primary)]'
+                        : 'text-[var(--text-dim)] hover:text-[var(--text-secondary)]'
+                      }`}
                   >
-                    {copied === 'tutorial' ? '✅ 已复制' : '📋 复制完整攻略'}
+                    📥 下载指令
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('tutorial')}
+                    className={`flex-1 py-2.5 rounded-lg text-sm font-medium transition-all ${activeTab === 'tutorial'
+                        ? 'bg-white/5 text-[var(--text-primary)]'
+                        : 'text-[var(--text-dim)] hover:text-[var(--text-secondary)]'
+                      }`}
+                  >
+                    ✨ AI 教程
                   </button>
                 </div>
-                <pre className="whitespace-pre-wrap text-gray-300 text-sm leading-relaxed font-sans">
-                  {getTutorialText(video)}
-                </pre>
-              </div>
-            )}
-          </div>
-        )}
+              )}
+
+              {/* Download Commands Tab */}
+              {activeTab === 'download' && (
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-3">
+                  {[
+                    { label: '🎬 最高画质', cmd: `yt-dlp -f "bestvideo+bestaudio" --merge-output-format mp4 "${video.url}"` },
+                    { label: '🎵 仅音频', cmd: `yt-dlp -x --audio-format mp3 "${video.url}"` },
+                    ...(video.platform === 'bilibili' ? [
+                      { label: '💬 字幕', cmd: `yt-dlp --write-sub --sub-lang zh-CN --skip-download "${video.url}"` },
+                    ] : []),
+                  ].map(item => (
+                    <div key={item.label} className="glass rounded-xl p-4">
+                      <div className="flex justify-between items-center mb-2">
+                        <span className="text-sm text-[var(--text-secondary)]">{item.label}</span>
+                        <button onClick={() => copy(item.cmd, item.label)}
+                          className="flex items-center gap-1.5 text-xs text-[var(--text-dim)] hover:text-[var(--text-secondary)] transition-colors">
+                          {copied === item.label ? <><Check className="w-3 h-3" /> 已复制</> : <><Copy className="w-3 h-3" /> 复制</>}
+                        </button>
+                      </div>
+                      <code className="block text-xs text-[#86efac] bg-black/30 rounded-lg p-3 overflow-x-auto">{item.cmd}</code>
+                    </div>
+                  ))}
+                </motion.div>
+              )}
+
+              {/* Tutorial Tab */}
+              {activeTab === 'tutorial' && (
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                  ref={tutorialRef}
+                  className="glass rounded-xl p-6 sm:p-8 max-h-[70vh] overflow-y-auto"
+                >
+                  {tutorialText ? (
+                    <div className={`tutorial-content ${tutorialLoading ? 'typing-cursor' : ''}`}>
+                      <ReactMarkdown>{tutorialText}</ReactMarkdown>
+                    </div>
+                  ) : (
+                    <div className="text-center py-12 text-[var(--text-dim)]">
+                      <Sparkles className="w-8 h-8 mx-auto mb-3 opacity-30" />
+                      <p>点击上方「AI 生成教程」按钮开始</p>
+                    </div>
+                  )}
+                  {tutorialText && !tutorialLoading && (
+                    <div className="mt-6 pt-4 border-t border-[var(--border)]">
+                      <button onClick={() => copy(tutorialText, 'tutorial')}
+                        className="text-sm text-[var(--gold)] hover:text-[var(--gold)]/80 flex items-center gap-2 transition-colors">
+                        {copied === 'tutorial' ? <><Check className="w-4 h-4" /> 已复制完整教程</> : <><Copy className="w-4 h-4" /> 复制完整教程 (Markdown)</>}
+                      </button>
+                    </div>
+                  )}
+                </motion.div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Footer */}
-        <div className="text-center mt-16 text-gray-600 text-sm">
-          <p>Powered by <a href="https://github.com/yt-dlp/yt-dlp" className="text-pink-500 hover:underline" target="_blank" rel="noopener noreferrer">yt-dlp</a> + B 站 API + noembed</p>
-          <p className="mt-1">© 2026 BiliHelper. 仅供学习交流使用。</p>
-        </div>
+        <motion.div
+          initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.5 }}
+          className="text-center mt-20 text-xs text-[var(--text-dim)]"
+        >
+          <p className="flex items-center justify-center gap-2">
+            <Play className="w-3 h-3" />
+            Powered by <a href="https://github.com/yt-dlp/yt-dlp" className="text-[var(--accent)] hover:underline" target="_blank" rel="noopener noreferrer">yt-dlp</a>
+            · B 站 API · Gemini AI
+          </p>
+          <p className="mt-1">仅供学习交流使用</p>
+        </motion.div>
       </div>
     </main>
   )

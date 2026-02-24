@@ -1,18 +1,144 @@
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;500&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --bg-deep: #06050a;
+  --bg-card: rgba(18, 16, 28, 0.7);
+  --bg-glass: rgba(255, 255, 255, 0.03);
+  --accent: #f43f5e;
+  --accent-glow: rgba(244, 63, 94, 0.25);
+  --gold: #d4a574;
+  --gold-glow: rgba(212, 165, 116, 0.2);
+  --text-primary: #f0eef5;
+  --text-secondary: #8b8798;
+  --text-dim: #4a4658;
+  --border: rgba(255, 255, 255, 0.06);
+  --success: #22c55e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
 body {
-  background: radial-gradient(circle at top center, #1a1a1a 0%, #09090b 100%);
+  font-family: 'Noto Sans SC', sans-serif;
+  background: var(--bg-deep);
+  color: var(--text-primary);
   min-height: 100vh;
 }
 
-.glass-card {
-  background: rgba(24, 24, 27, 0.6);
-  backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+/* Cinematic gradient background */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background:
+    radial-gradient(ellipse 80% 50% at 50% -20%, rgba(244, 63, 94, 0.08), transparent),
+    radial-gradient(ellipse 60% 40% at 80% 80%, rgba(99, 102, 241, 0.06), transparent),
+    radial-gradient(ellipse 50% 50% at 20% 60%, rgba(212, 165, 116, 0.04), transparent);
+  pointer-events: none;
+  z-index: 0;
 }
 
-.glow-pink {
-  box-shadow: 0 0 30px rgba(251, 114, 153, 0.15);
+/* Glass card */
+.glass {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(20px) saturate(1.2);
+  -webkit-backdrop-filter: blur(20px) saturate(1.2);
 }
+
+/* Code blocks */
+code, .code-block {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Glow button */
+.btn-glow {
+  position: relative;
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+.btn-glow::before {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  background: linear-gradient(135deg, var(--accent), #8b5cf6, var(--gold));
+  border-radius: inherit;
+  opacity: 0;
+  transition: opacity 0.3s;
+  z-index: -1;
+  filter: blur(8px);
+}
+.btn-glow:hover::before {
+  opacity: 1;
+}
+
+/* Shimmer loading */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, transparent 25%, rgba(255,255,255,0.04) 50%, transparent 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+/* Typing cursor */
+@keyframes blink {
+  50% { opacity: 0; }
+}
+.typing-cursor::after {
+  content: '▊';
+  color: var(--accent);
+  animation: blink 1s step-end infinite;
+  margin-left: 2px;
+}
+
+/* Tutorial content styling */
+.tutorial-content h1 { font-size: 1.5rem; font-weight: 700; margin: 1.5rem 0 0.75rem; color: var(--text-primary); }
+.tutorial-content h2 { font-size: 1.25rem; font-weight: 700; margin: 1.25rem 0 0.5rem; color: var(--gold); }
+.tutorial-content h3 { font-size: 1.1rem; font-weight: 600; margin: 1rem 0 0.5rem; color: var(--text-primary); }
+.tutorial-content p { margin: 0.5rem 0; line-height: 1.8; color: var(--text-secondary); }
+.tutorial-content ul, .tutorial-content ol { margin: 0.5rem 0; padding-left: 1.5rem; color: var(--text-secondary); }
+.tutorial-content li { margin: 0.25rem 0; line-height: 1.7; }
+.tutorial-content strong { color: var(--text-primary); font-weight: 600; }
+.tutorial-content code {
+  background: rgba(0,0,0,0.4);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.85em;
+  color: #a78bfa;
+}
+.tutorial-content pre {
+  background: rgba(0,0,0,0.5);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  overflow-x: auto;
+  margin: 0.75rem 0;
+}
+.tutorial-content pre code {
+  background: none;
+  padding: 0;
+  color: #86efac;
+}
+.tutorial-content blockquote {
+  border-left: 3px solid var(--accent);
+  padding-left: 1rem;
+  margin: 0.75rem 0;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--text-dim); border-radius: 4px; }
