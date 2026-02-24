@@ -1,226 +1,297 @@
-"use client";
+'use client'
+import { useState } from 'react'
 
-import { useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { Search, ArrowRight, Download, BookOpen, ExternalLink, Copy, Check, Clock, Eye, ThumbsUp } from "lucide-react";
-import ReactMarkdown from 'react-markdown';
+interface VideoInfo {
+  platform: string
+  title: string
+  uploader: string
+  avatar?: string
+  duration?: number
+  views?: number
+  likes?: number
+  coins?: number
+  favorites?: number
+  danmakus?: number
+  description?: string
+  thumbnail?: string
+  bvid?: string
+  aid?: number
+  url: string
+}
+
+function formatDuration(s: number) {
+  const m = Math.floor(s / 60)
+  const sec = s % 60
+  return `${m}:${sec.toString().padStart(2, '0')}`
+}
+
+function formatNumber(n: number) {
+  if (n >= 100000000) return (n / 100000000).toFixed(1) + '亿'
+  if (n >= 10000) return (n / 10000).toFixed(1) + '万'
+  return n.toLocaleString()
+}
 
 export default function Home() {
-  const [url, setUrl] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [videoInfo, setVideoInfo] = useState<any>(null);
-  const [activeTab, setActiveTab] = useState<"download" | "tutorial">("download");
-  const [copied, setCopied] = useState(false);
+  const [url, setUrl] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [video, setVideo] = useState<VideoInfo | null>(null)
+  const [tab, setTab] = useState<'download' | 'tutorial'>('download')
+  const [copied, setCopied] = useState('')
 
-  const handleFetch = async () => {
-    if (!url) return;
-    setLoading(true);
-    setVideoInfo(null);
+  async function handleAnalyze() {
+    if (!url.trim()) return
+    setLoading(true)
+    setError('')
+    setVideo(null)
     try {
-      const res = await fetch("/api/video-info", {
-        method: "POST",
-        body: JSON.stringify({ url }),
-      });
-      const data = await res.json();
-      if (data.error) {
-        alert(data.error);
-      } else {
-        setVideoInfo(data);
-      }
-    } catch (e) {
-      alert("网络错误");
+      const resp = await fetch('/api/video-info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: url.trim() }),
+      })
+      const data = await resp.json()
+      if (!resp.ok) throw new Error(data.error || '解析失败')
+      setVideo(data)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '未知错误')
     } finally {
-      setLoading(false);
+      setLoading(false)
     }
-  };
+  }
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
+  function copyToClipboard(text: string, label: string) {
+    navigator.clipboard.writeText(text)
+    setCopied(label)
+    setTimeout(() => setCopied(''), 2000)
+  }
 
-  const formatDuration = (s: number) => {
-    const min = Math.floor(s / 60);
-    const sec = s % 60;
-    return `${min}:${sec.toString().padStart(2, "0")}`;
-  };
+  function getDownloadCommands(v: VideoInfo) {
+    const u = v.url
+    return [
+      { label: '🎬 最高画质下载', cmd: `yt-dlp -f "bestvideo+bestaudio" --merge-output-format mp4 "${u}"` },
+      { label: '🎵 仅下载音频 (MP3)', cmd: `yt-dlp -x --audio-format mp3 "${u}"` },
+      { label: '📋 查看所有画质', cmd: `yt-dlp -F "${u}"` },
+      ...(v.platform === 'bilibili' ? [
+        { label: '💬 下载字幕', cmd: `yt-dlp --write-sub --sub-lang zh-CN --skip-download "${u}"` },
+        { label: '🔑 大会员画质下载', cmd: `yt-dlp --cookies-from-browser chrome -f "bestvideo+bestaudio" "${u}"` },
+      ] : []),
+      { label: '📊 获取元数据 (JSON)', cmd: `yt-dlp --dump-json "${u}"` },
+    ]
+  }
 
-  const tutorialContent = videoInfo ? `
-# 如何下载《${videoInfo.title}》
-
-这是一份为您准备的简易下载攻略。
-
-### 第一步：安装工具
-如果您是第一次下载，需要先安装开源工具 **yt-dlp**：
-- **Windows**: 下载 [yt-dlp.exe](https://github.com/yt-dlp/yt-dlp/releases) 并放入文件夹。
-- **macOS**: 在终端运行 \`brew install yt-dlp\`。
-
-### 第二步：复制下载指令
-点击“下载指令”标签页，复制为您生成的专用命令。
-
-### 第三步：开始下载
-打开终端（命令行），粘贴刚才复制的命令并回车。
-
----
-*本教程由 BiliHelper 为视频《${videoInfo.title}》自动生成。*
-` : "";
+  function getTutorialText(v: VideoInfo) {
+    const platform = v.platform === 'bilibili' ? 'B 站' : 'YouTube'
+    const lines = [
+      `📺 ${v.title}`,
+      '',
+      `视频信息`,
+      `• ${platform} UP主/频道: ${v.uploader}`,
+    ]
+    if (v.duration) lines.push(`• 时长: ${formatDuration(v.duration)}`)
+    if (v.views) lines.push(`• 播放量: ${formatNumber(v.views)}`)
+    lines.push(`• 链接: ${v.url}`)
+    if (v.description) {
+      lines.push('', `简介`, v.description.slice(0, 200))
+    }
+    lines.push(
+      '', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+      '', '🔰 下载教程（零基础 3 步搞定）',
+      '',
+      '第 1 步：安装工具',
+      '',
+      'Mac 用户:',
+      '  brew install yt-dlp ffmpeg',
+      '',
+      'Windows 用户:',
+      '  1. 下载 yt-dlp: https://github.com/yt-dlp/yt-dlp/releases',
+      '  2. 下载 ffmpeg: https://ffmpeg.org/download.html',
+      '  3. 解压到同一目录，添加到 PATH',
+      '',
+      '第 2 步：打开终端，粘贴命令',
+      '',
+      '# 下载最高画质',
+      `yt-dlp -f "bestvideo+bestaudio" --merge-output-format mp4 "${v.url}"`,
+      '',
+      '# 只要音频',
+      `yt-dlp -x --audio-format mp3 "${v.url}"`,
+      '',
+      '第 3 步：播放',
+      '双击下载的文件即可 🎉',
+      '',
+      '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+      '',
+      '⚠️ 常见问题',
+      '',
+      '报错"需要登录"？',
+      `  yt-dlp --cookies-from-browser chrome "${v.url}"`,
+      '',
+      '下载很慢？',
+      `  yt-dlp --limit-rate 500K "${v.url}"`,
+      '',
+      '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+      '由 BiliHelper 自动生成',
+    )
+    return lines.join('\n')
+  }
 
   return (
-    <main className="min-h-screen flex flex-col items-center p-6 md:p-24 relative overflow-hidden">
-      {/* Bg Decor */}
-      <div className="absolute top-0 left-1/2 -translate-x-1/2 w-full h-[500px] bg-[#FB7299] opacity-[0.03] blur-[120px] pointer-events-none rounded-full" />
+    <main className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 text-white">
+      <div className="max-w-3xl mx-auto px-4 py-16">
+        {/* Header */}
+        <div className="text-center mb-12">
+          <h1 className="text-5xl font-bold mb-3">
+            <span className="text-white">Bili</span>
+            <span className="text-pink-400">Helper</span>
+          </h1>
+          <p className="text-gray-400 text-lg">真正能用的视频信息查询 + 小白攻略生成器</p>
+        </div>
 
-      {/* Header */}
-      <motion.div 
-        initial={{ opacity: 0, y: -20 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="text-center mb-12"
-      >
-        <h1 className="text-4xl md:text-6xl font-black tracking-tighter mb-4 text-white">
-          Bili<span className="text-[#FB7299]">Helper</span>
-        </h1>
-        <p className="text-zinc-500 font-medium">真正能用的 B 站 / YouTube 视频助手</p>
-      </motion.div>
-
-      {/* Input Section */}
-      <div className="w-full max-w-2xl mb-12">
-        <div className="glass-card p-2 rounded-2xl flex items-center gap-2 glow-pink">
-          <div className="pl-4 text-zinc-500">
-            <Search size={20} />
-          </div>
-          <input 
+        {/* Input */}
+        <div className="flex gap-3 mb-8">
+          <input
             type="text"
-            placeholder="粘贴视频链接 (支持 BV号, b23.tv, YouTube)"
-            className="flex-1 bg-transparent border-none focus:ring-0 text-zinc-100 py-3 outline-none"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleFetch()}
+            onKeyDown={(e) => e.key === 'Enter' && handleAnalyze()}
+            placeholder="粘贴 B 站或 YouTube 视频链接..."
+            className="flex-1 bg-gray-800/60 border border-gray-700 rounded-xl px-5 py-4 text-white placeholder-gray-500 focus:outline-none focus:border-pink-500 focus:ring-1 focus:ring-pink-500 transition-all"
           />
-          <button 
-            onClick={handleFetch}
-            disabled={loading || !url}
-            className="bg-[#FB7299] hover:bg-[#ff85a9] text-white px-6 py-3 rounded-xl font-bold transition-all disabled:opacity-50"
+          <button
+            onClick={handleAnalyze}
+            disabled={loading || !url.trim()}
+            className="px-8 py-4 bg-gradient-to-r from-pink-500 to-rose-500 rounded-xl font-semibold hover:from-pink-600 hover:to-rose-600 disabled:opacity-40 disabled:cursor-not-allowed transition-all whitespace-nowrap"
           >
-            {loading ? "正在解析..." : "解析"}
+            {loading ? (
+              <span className="flex items-center gap-2">
+                <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                解析中
+              </span>
+            ) : '解析 🔍'}
           </button>
         </div>
-      </div>
 
-      <AnimatePresence mode="wait">
-        {videoInfo ? (
-          <motion.div 
-            key="result"
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="w-full max-w-4xl space-y-8"
-          >
-            {/* Info Card */}
-            <div className="glass-card rounded-3xl overflow-hidden flex flex-col md:flex-row shadow-2xl">
-              <div className="md:w-2/5 aspect-video relative group">
-                <img 
-                   src={videoInfo.thumbnail} 
-                   alt={videoInfo.title} 
-                   className="w-full h-full object-cover"
-                />
-                <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                   <a href={videoInfo.url} target="_blank" className="bg-white/20 backdrop-blur-md p-3 rounded-full">
-                     <ExternalLink size={24} className="text-white" />
-                   </a>
-                </div>
-              </div>
-              <div className="p-8 flex-1 flex flex-col justify-between">
-                <div>
-                  <h2 className="text-2xl font-bold text-white mb-2 leading-tight">{videoInfo.title}</h2>
-                  <div className="flex items-center gap-4 text-zinc-400 text-sm mb-4">
-                    <span className="flex items-center gap-1"><Clock size={14} /> {formatDuration(videoInfo.duration || 0)}</span>
-                    <span className="flex items-center gap-1"><Eye size={14} /> {videoInfo.views?.toLocaleString()} 播放</span>
-                    <span className="flex items-center gap-1"><ThumbsUp size={14} /> {videoInfo.likes?.toLocaleString()} 赞</span>
-                  </div>
-                </div>
-                <div className="flex items-center gap-3 mt-4 pt-4 border-t border-white/5">
-                  {videoInfo.avatar && <img src={videoInfo.avatar} className="w-8 h-8 rounded-full" />}
-                  <span className="text-zinc-300 font-semibold">{videoInfo.uploader}</span>
-                </div>
-              </div>
-            </div>
+        {/* Error */}
+        {error && (
+          <div className="bg-red-900/30 border border-red-700 rounded-xl p-4 mb-6 text-red-300">
+            ❌ {error}
+          </div>
+        )}
 
-            {/* Tabs & Content */}
-            <div className="space-y-4">
-              <div className="flex gap-2">
-                <button 
-                  onClick={() => setActiveTab("download")}
-                  className={cn(
-                    "px-6 py-2 rounded-full font-bold transition-all flex items-center gap-2",
-                    activeTab === "download" ? "bg-white text-black" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"
+        {/* Video Info Card */}
+        {video && (
+          <div className="space-y-6">
+            <div className="bg-gray-800/40 border border-gray-700/50 rounded-2xl overflow-hidden">
+              {video.thumbnail && (
+                <div className="relative">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={video.thumbnail} alt={video.title} className="w-full h-48 object-cover" />
+                  {video.duration && (
+                    <span className="absolute bottom-3 right-3 bg-black/80 text-white text-sm px-2 py-1 rounded">
+                      {formatDuration(video.duration)}
+                    </span>
                   )}
-                >
-                  <Download size={18} /> 下载指令
-                </button>
-                <button 
-                  onClick={() => setActiveTab("tutorial")}
-                  className={cn(
-                    "px-6 py-2 rounded-full font-bold transition-all flex items-center gap-2",
-                    activeTab === "tutorial" ? "bg-white text-black" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"
+                </div>
+              )}
+              <div className="p-6">
+                <h2 className="text-xl font-bold mb-2">{video.title}</h2>
+                <div className="flex items-center gap-3 text-gray-400 mb-4">
+                  {video.avatar && (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={video.avatar} alt="" className="w-8 h-8 rounded-full" />
                   )}
-                >
-                  <BookOpen size={18} /> 小白攻略
-                </button>
-              </div>
-
-              <div className="glass-card rounded-3xl p-8 min-h-[300px]">
-                {activeTab === "download" ? (
-                  <div className="space-y-6">
-                    <div>
-                      <label className="text-xs font-black text-zinc-500 uppercase tracking-widest mb-3 block">基础下载命令 (8K/HDR/4K)</label>
-                      <div className="bg-black/50 p-6 rounded-2xl font-mono text-[#FB7299] relative group">
-                        <code className="break-all block pr-12">
-                          yt-dlp -f "bestvideo+bestaudio" --merge-output-format mp4 "{videoInfo.url}"
-                        </code>
-                        <button 
-                          onClick={() => copyToClipboard(`yt-dlp -f "bestvideo+bestaudio" --merge-output-format mp4 "${videoInfo.url}"`)}
-                          className="absolute right-4 top-1/2 -translate-y-1/2 p-2 bg-zinc-800 rounded-lg hover:bg-zinc-700 transition-colors"
-                        >
-                          {copied ? <Check size={18} className="text-green-500" /> : <Copy size={18} />}
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                       <div className="bg-zinc-900/50 p-4 rounded-xl border border-white/5">
-                         <p className="text-xs text-zinc-500 mb-2 uppercase font-bold">仅下载音频 (MP3)</p>
-                         <code className="text-sm text-zinc-300 break-all">yt-dlp -x --audio-format mp3 "{videoInfo.url}"</code>
-                       </div>
-                       {videoInfo.platform === 'bilibili' && (
-                         <div className="bg-zinc-900/50 p-4 rounded-xl border border-white/5">
-                           <p className="text-xs text-zinc-500 mb-2 uppercase font-bold">仅下载中文字幕</p>
-                           <code className="text-sm text-zinc-300 break-all">yt-dlp --write-sub --sub-lang zh-CN --skip-download "{videoInfo.url}"</code>
-                         </div>
-                       )}
-                    </div>
+                  <span className="font-medium">{video.uploader}</span>
+                  <span className="text-xs bg-gray-700 px-2 py-0.5 rounded">
+                    {video.platform === 'bilibili' ? 'B站' : 'YouTube'}
+                  </span>
+                </div>
+                {video.views !== undefined && (
+                  <div className="flex gap-4 text-sm text-gray-500">
+                    <span>▶ {formatNumber(video.views)}</span>
+                    {video.likes !== undefined && <span>👍 {formatNumber(video.likes)}</span>}
+                    {video.coins !== undefined && <span>🪙 {formatNumber(video.coins)}</span>}
+                    {video.danmakus !== undefined && <span>💬 {formatNumber(video.danmakus)}</span>}
                   </div>
-                ) : (
-                  <article className="prose prose-invert max-w-none">
-                    <ReactMarkdown>{tutorialContent}</ReactMarkdown>
-                  </article>
+                )}
+                {video.description && (
+                  <p className="mt-4 text-sm text-gray-400 line-clamp-3">{video.description}</p>
                 )}
               </div>
             </div>
-          </motion.div>
-        ) : loading ? (
-          <div className="w-full max-w-4xl space-y-8 animate-pulse">
-            <div className="h-64 bg-zinc-900 rounded-3xl" />
-            <div className="space-y-4">
-              <div className="h-10 bg-zinc-900 w-48 rounded-full" />
-              <div className="h-80 bg-zinc-900 rounded-3xl" />
-            </div>
-          </div>
-        ) : null}
-      </AnimatePresence>
-    </main>
-  );
-}
 
-function cn(...inputs: any[]) {
-  return inputs.filter(Boolean).join(" ");
+            {/* Tabs */}
+            <div className="flex gap-2">
+              <button
+                onClick={() => setTab('download')}
+                className={`flex-1 py-3 rounded-xl font-medium transition-all ${tab === 'download'
+                    ? 'bg-pink-500/20 text-pink-400 border border-pink-500/50'
+                    : 'bg-gray-800/40 text-gray-400 border border-gray-700/50 hover:bg-gray-800/60'
+                  }`}
+              >
+                📥 下载指令
+              </button>
+              <button
+                onClick={() => setTab('tutorial')}
+                className={`flex-1 py-3 rounded-xl font-medium transition-all ${tab === 'tutorial'
+                    ? 'bg-pink-500/20 text-pink-400 border border-pink-500/50'
+                    : 'bg-gray-800/40 text-gray-400 border border-gray-700/50 hover:bg-gray-800/60'
+                  }`}
+              >
+                📖 小白攻略
+              </button>
+            </div>
+
+            {/* Download Commands */}
+            {tab === 'download' && (
+              <div className="space-y-3">
+                {getDownloadCommands(video).map((item) => (
+                  <div key={item.label} className="bg-gray-800/40 border border-gray-700/50 rounded-xl p-4">
+                    <div className="flex justify-between items-center mb-2">
+                      <span className="text-sm font-medium text-gray-300">{item.label}</span>
+                      <button
+                        onClick={() => copyToClipboard(item.cmd, item.label)}
+                        className="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded-lg transition-colors"
+                      >
+                        {copied === item.label ? '✅ 已复制' : '📋 复制'}
+                      </button>
+                    </div>
+                    <code className="block text-xs text-green-400 bg-black/30 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap break-all">
+                      {item.cmd}
+                    </code>
+                  </div>
+                ))}
+                <div className="bg-amber-900/20 border border-amber-700/40 rounded-xl p-4 text-sm text-amber-300">
+                  💡 使用前请先安装 yt-dlp：<code className="bg-black/30 px-2 py-0.5 rounded">brew install yt-dlp ffmpeg</code>
+                </div>
+              </div>
+            )}
+
+            {/* Tutorial */}
+            {tab === 'tutorial' && (
+              <div className="bg-gray-800/40 border border-gray-700/50 rounded-xl p-6">
+                <div className="flex justify-between items-center mb-4">
+                  <h3 className="font-bold text-lg">📖 下载攻略</h3>
+                  <button
+                    onClick={() => copyToClipboard(getTutorialText(video), 'tutorial')}
+                    className="text-sm bg-pink-500/20 text-pink-400 hover:bg-pink-500/30 px-4 py-2 rounded-lg transition-colors"
+                  >
+                    {copied === 'tutorial' ? '✅ 已复制' : '📋 复制完整攻略'}
+                  </button>
+                </div>
+                <pre className="whitespace-pre-wrap text-gray-300 text-sm leading-relaxed font-sans">
+                  {getTutorialText(video)}
+                </pre>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Footer */}
+        <div className="text-center mt-16 text-gray-600 text-sm">
+          <p>Powered by <a href="https://github.com/yt-dlp/yt-dlp" className="text-pink-500 hover:underline" target="_blank" rel="noopener noreferrer">yt-dlp</a> + B 站 API + noembed</p>
+          <p className="mt-1">© 2026 BiliHelper. 仅供学习交流使用。</p>
+        </div>
+      </div>
+    </main>
+  )
 }
