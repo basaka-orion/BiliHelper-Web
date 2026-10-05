@@ -30,8 +30,8 @@
 
   /* Text */
   --text-primary: #f0eef5;
-  --text-secondary: #9290a0;
-  --text-dim: #4e4b5c;
+  --text-secondary: #aaa7b8;
+  --text-dim: #9692a8;
 
   /* Borders */
   --border: rgba(255, 255, 255, 0.06);
@@ -417,4 +417,12 @@ code,
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 3px;
+}
+button:disabled { cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
