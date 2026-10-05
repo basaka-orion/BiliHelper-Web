@@ -65,7 +65,7 @@ export async function POST(req: NextRequest) {
     } catch { subtitleNotice = '平台字幕暂不可用，可粘贴字幕文本或让 AI 服务尝试提取。' }
     return Response.json({ ...info, subtitles, hasSubtitles: subtitles.length > 0, subtitleNotice })
   } catch (e) {
-    if (resolvedLink?.platform === 'bilibili' && e instanceof HttpError && e.status === 502) return Response.json({ error: e.message, browserFallback: true, resolvedUrl: resolvedLink.url }, { status: 502 })
+    if (resolvedLink?.platform === 'bilibili' && (!(e instanceof HttpError) || e.status >= 500)) return Response.json({ error: '云端暂时无法访问 B 站，正在尝试浏览器解析', browserFallback: true, resolvedUrl: resolvedLink.url }, { status: 502 })
     return errorResponse(e)
   }
 }

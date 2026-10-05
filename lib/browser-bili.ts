@@ -19,7 +19,6 @@ function jsonp<T>(path: string, signal: AbortSignal): Promise<T> {
     }
     script.onerror = () => { cleanup(); reject(new Error('浏览器暂时无法访问 B 站，请检查网络后重试')) }
     script.src = `https://api.bilibili.com${path}&jsonp=jsonp&callback=${callback}`
-    script.referrerPolicy = 'no-referrer'
     signal.addEventListener('abort', stopped, { once: true })
     document.head.appendChild(script)
   })

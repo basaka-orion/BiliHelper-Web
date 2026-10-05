@@ -2,7 +2,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
-import { downloadCommand } from '../lib/video-url'
+import { downloadCommand, parseVideoLink } from '../lib/video-url'
 import { readSSE } from '../lib/sse'
 import { browserVideoInfo } from '../lib/browser-bili'
 import { Search, Download, Sparkles, Copy, Check, AlertCircle, Clock, Eye, ThumbsUp, MessageCircle, ChevronDown, ChevronUp, Zap, FileText, ExternalLink } from 'lucide-react'
@@ -111,14 +111,21 @@ export default function Home() {
     setTutorialText(''); setTutorialError(''); setTutorialSource(''); setTranscript(''); setSubtitleIndex('auto'); setActiveTab('download'); setDownloadResult(null); setDescExpanded(false)
     const timeout = setTimeout(() => controller.abort(), 55000)
     try {
-      const r = await fetch('/api/video-info', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-        body: JSON.stringify({ url: value.trim() }),
-      })
-      let d = await r.json().catch(() => { throw new Error(`服务暂不可用（${r.status}），请稍后重试。`) })
-      if (!r.ok) {
-        if (d.browserFallback) d = await browserVideoInfo(d.resolvedUrl || value, controller.signal)
-        else throw new Error(d.error || `解析失败（${r.status}）`)
+      const link = parseVideoLink(value)
+      let d
+      if (link.platform === 'bilibili' && !link.short) {
+        try { d = await browserVideoInfo(link.url, controller.signal) } catch (e) { if (controller.signal.aborted) throw e }
+      }
+      if (!d) {
+        const r = await fetch('/api/video-info', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+          body: JSON.stringify({ url: value.trim() }),
+        })
+        d = await r.json().catch(() => { throw new Error(`服务暂不可用（${r.status}），请稍后重试。`) })
+        if (!r.ok) {
+          if (d.browserFallback) d = await browserVideoInfo(d.resolvedUrl || value, controller.signal)
+          else throw new Error(d.error || `解析失败（${r.status}）`)
+        }
       }
       if (controller.signal.aborted) return
       setVideo(d); setUrl(d.url)
@@ -164,7 +171,7 @@ export default function Home() {
     try {
       const r = await fetch('/api/tutorial', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-        body: JSON.stringify({ subtitleUrl, title: video.title, videoUrl: video.url, transcript, sourceMode: subtitleIndex === 'auto' ? 'auto' : 'subtitle' }),
+        body: JSON.stringify({ subtitleUrl, title: `${video.title}${(video.pages?.length || 0) > 1 ? ` · P${video.selectedPage} ${video.pages?.find(p => p.page === video.selectedPage)?.title || ''}` : ''}`, videoUrl: video.url, transcript, sourceMode: subtitleIndex === 'auto' ? 'auto' : 'subtitle' }),
       })
       if (!r.ok) { await responseJson(r); return }
       if (!r.body || !r.headers.get('content-type')?.includes('text/event-stream')) throw new Error('AI 服务返回格式异常，请重试。')
@@ -367,6 +374,7 @@ export default function Home() {
                     )}
                   </div>
 
+                  {(video.pages?.length || 0) > 1 && <p className="text-sm text-[var(--accent)] mb-4">当前分 P：P{video.selectedPage} · {video.pages?.find(p => p.page === video.selectedPage)?.title}</p>}
                   {/* Stats row */}
                   {video.views !== undefined && (
                     <div className="flex flex-wrap gap-2 mb-4">

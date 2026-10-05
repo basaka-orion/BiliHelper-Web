@@ -30,7 +30,7 @@ export async function POST(req: NextRequest) {
         try {
           let source = typeof transcript === 'string' ? transcript.trim() : ''
           if (source && source.length < 30) throw new Error('字幕文本太短，请粘贴至少 30 个字符的实际视频内容。')
-          if (!source && bibiToken && sourceMode !== 'subtitle') {
+          if (!source && bibiToken && sourceMode !== 'subtitle' && link.page === 1) {
             send({ status: '正在提取视频内容并生成学习笔记…' })
             try {
               const response = await requestJson('https://api.bibigpt.co/api/v1/summarizeWithConfig', {
@@ -53,7 +53,7 @@ export async function POST(req: NextRequest) {
               source = (data.body || []).map((item: { content: string }) => item.content).join('\n')
             } catch { /* Return an actionable source error below. */ }
           }
-          if (!source) throw new Error('暂时无法提取视频字幕。请在「字幕来源」中粘贴字幕文本后重试；不会根据简介编造视频内容。')
+          if (!source) throw new Error(link.page > 1 ? '当前分 P 没有可读取的字幕，请粘贴这一分 P 的实际字幕后重试，避免误用第 1 P 内容。' : '暂时无法提取视频字幕。请在「字幕来源」中粘贴字幕文本后重试；不会根据简介编造视频内容。')
           if (!siliconKey) throw new Error('字幕已取得，但字幕分析服务尚未配置。请联系管理员配置 SILICONFLOW_API_KEY。')
           send({ source: transcript?.trim() ? '你提供的字幕文本' : '平台字幕', status: '正在整理关键内容…' })
           const response = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
