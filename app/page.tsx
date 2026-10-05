@@ -6,7 +6,7 @@ import remarkGfm from 'remark-gfm'
 import { downloadCommand, parseVideoLink } from '../lib/video-url'
 import { readSSE } from '../lib/sse'
 import { tutorialMarkdown } from '../lib/markdown'
-import { browserVideoInfo, browserMediaInfo } from '../lib/browser-bili'
+import { browserVideoInfo } from '../lib/browser-bili'
 import { Search, Download, Sparkles, Copy, Check, AlertCircle, Clock, Eye, ThumbsUp, MessageCircle, ChevronDown, ChevronUp, Zap, FileText, ExternalLink } from 'lucide-react'
 
 /* ─── Types ─── */
@@ -144,23 +144,8 @@ export default function Home() {
     if (!video || downloading) return
     const controller = new AbortController(); downloadAbort.current = controller
     setDownloading(true); setDownloadResult(null); setActiveTab('download')
-    const timeout = setTimeout(() => controller.abort(), 50000)
+    const timeout = setTimeout(() => controller.abort(), 65000)
     try {
-      if (video.bvid && video.cid) {
-        try {
-          const media = await browserMediaInfo(video.bvid, video.cid, controller.signal, webQuality)
-          if (media) {
-            const ready = await responseJson(await fetch('/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal, body: JSON.stringify({ url: video.url, bvid: video.bvid, cid: video.cid, mediaUrl: media.url }) }))
-            if (ready.mode !== 'ready') { setDownloadResult(ready); return }
-            const a = document.createElement('a')
-            a.href = `/api/download?media=${encodeURIComponent(media.url)}&name=${video.bvid}-P${video.selectedPage || 1}`
-            a.download = `${video.bvid}-P${video.selectedPage || 1}.mp4`
-            document.body.appendChild(a); a.click(); a.remove()
-            setDownloadResult({ mode: 'success', message: '已开始网页下载，请在浏览器下载列表确认完成。网页使用平台公开提供的画质；最高画质请使用本机指令。' })
-            return
-          }
-        } catch (e) { if (controller.signal.aborted) throw e }
-      }
       const r = await fetch('/api/download', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
         body: JSON.stringify({ url: video.url, bvid: video.bvid, cid: video.cid, quality: webQuality }),
