@@ -30,8 +30,8 @@
 
   /* Text */
   --text-primary: #f0eef5;
-  --text-secondary: #9290a0;
-  --text-dim: #4e4b5c;
+  --text-secondary: #aaa7b8;
+  --text-dim: #9692a8;
 
   /* Borders */
   --border: rgba(255, 255, 255, 0.06);
@@ -418,3 +418,16 @@ code,
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 3px;
+}
+button:disabled { cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
+
+.tutorial-content table { display: block; width: 100%; overflow-x: auto; border-collapse: collapse; margin: 1rem 0; font-size: .875rem; }
+.tutorial-content th, .tutorial-content td { border: 1px solid var(--border-hover); padding: .6rem .8rem; text-align: left; min-width: 6rem; }
+.tutorial-content th { color: var(--text-primary); background: var(--bg-glass-hover); }
+.tutorial-content a { color: var(--accent-bright); text-decoration: underline; overflow-wrap: anywhere; }

@@ -2,6 +2,11 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import { downloadCommand, parseVideoLink } from '../lib/video-url'
+import { readSSE } from '../lib/sse'
+import { tutorialMarkdown } from '../lib/markdown'
+import { browserVideoInfo } from '../lib/browser-bili'
 import { Search, Download, Sparkles, Copy, Check, AlertCircle, Clock, Eye, ThumbsUp, MessageCircle, ChevronDown, ChevronUp, Zap, FileText, ExternalLink } from 'lucide-react'
 
 /* ─── Types ─── */
@@ -11,7 +16,7 @@ interface VideoInfo {
   favorites?: number; danmakus?: number; description?: string
   thumbnail?: string; bvid?: string; cid?: number; aid?: number
   url: string; subtitles: { lan: string; lan_doc: string; subtitle_url: string }[]
-  hasSubtitles: boolean
+  hasSubtitles: boolean; subtitleNotice?: string; pages?: { cid: number; page: number; title: string; duration: number }[]; selectedPage?: number
 }
 
 /* ─── Helpers ─── */
@@ -21,8 +26,8 @@ function fmt(n: number) {
   return n.toLocaleString()
 }
 function fmtDur(s: number) {
-  const m = Math.floor(s / 60), sec = s % 60
-  return `${m}:${sec.toString().padStart(2, '0')}`
+  const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, sec = Math.floor(s) % 60
+  return `${h ? `${h}:${String(m).padStart(2, '0')}` : m}:${String(sec).padStart(2, '0')}`
 }
 function proxyImg(url: string) {
   if (!url) return ''
@@ -59,6 +64,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [video, setVideo] = useState<VideoInfo | null>(null)
+  const [webQuality, setWebQuality] = useState(32)
   const [downloading, setDownloading] = useState(false)
   const [downloadResult, setDownloadResult] = useState<{ mode: string; command?: string; message?: string } | null>(null)
   const [tutorialText, setTutorialText] = useState('')
@@ -66,96 +72,137 @@ export default function Home() {
   const [copied, setCopied] = useState('')
   const [activeTab, setActiveTab] = useState<'download' | 'tutorial'>('download')
   const [descExpanded, setDescExpanded] = useState(false)
+  const [transcript, setTranscript] = useState('')
+  const [subtitleIndex, setSubtitleIndex] = useState('auto')
+  const [tutorialStatus, setTutorialStatus] = useState('')
+  const [tutorialSource, setTutorialSource] = useState('')
+  const [tutorialError, setTutorialError] = useState('')
+  const [history, setHistory] = useState<{ url: string; title: string }[]>([])
+  const contentRef = useRef<HTMLDivElement>(null)
+  const analyzeAbort = useRef<AbortController | null>(null)
+  const tutorialAbort = useRef<AbortController | null>(null)
+  const downloadAbort = useRef<AbortController | null>(null)
   const tutorialRef = useRef<HTMLDivElement>(null)
   const heroRef = useRef<HTMLElement>(null)
 
   useMouseGlow(heroRef)
 
-  const copy = useCallback((text: string, label: string) => {
-    navigator.clipboard.writeText(text)
-    setCopied(label)
-    setTimeout(() => setCopied(''), 2000)
+  useEffect(() => {
+    try { const saved = JSON.parse(localStorage.getItem('bili-history') || '[]'); if (Array.isArray(saved)) setHistory(saved.filter(x => typeof x?.url === 'string' && typeof x?.title === 'string').slice(0, 8)) } catch {}
+    return () => { analyzeAbort.current?.abort(); tutorialAbort.current?.abort(); downloadAbort.current?.abort() }
+  }, [])
+  useEffect(() => { if (video || error) contentRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }, [video, error])
+
+  const copy = useCallback(async (text: string, label: string) => {
+    try { await navigator.clipboard.writeText(text); setCopied(label); setTimeout(() => setCopied(''), 2000) }
+    catch { setError('复制失败，请选中内容手动复制。') }
   }, [])
 
-  async function analyze() {
-    if (!url.trim()) return
-    setLoading(true); setError(''); setVideo(null)
-    setTutorialText(''); setDownloadResult(null); setDescExpanded(false)
+  async function responseJson(r: Response) {
+    let data
+    try { data = await r.json() } catch { throw new Error(`服务暂不可用（${r.status}），请稍后重试。`) }
+    if (!r.ok) throw new Error(data.error || `请求失败（${r.status}）`)
+    return data
+  }
+
+  async function analyze(input?: string) {
+    const value = input || url
+    if (!value.trim()) return
+    analyzeAbort.current?.abort(); tutorialAbort.current?.abort(); downloadAbort.current?.abort()
+    const controller = new AbortController(); analyzeAbort.current = controller
+    setUrl(value); setLoading(true); setError(''); setVideo(null); setTutorialLoading(false); setDownloading(false)
+    setTutorialText(''); setTutorialError(''); setTutorialSource(''); setTranscript(''); setSubtitleIndex('auto'); setActiveTab('download'); setDownloadResult(null); setDescExpanded(false)
+    const timeout = setTimeout(() => controller.abort(), 55000)
     try {
-      const r = await fetch('/api/video-info', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url.trim() }),
-      })
-      const d = await r.json()
-      if (!r.ok) throw new Error(d.error)
-      setVideo(d)
+      const link = parseVideoLink(value)
+      let d
+      if (link.platform === 'bilibili' && !link.short) {
+        try { d = await browserVideoInfo(link.url, controller.signal) } catch (e) { if (controller.signal.aborted) throw e }
+      }
+      if (!d) {
+        const r = await fetch('/api/video-info', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+          body: JSON.stringify({ url: value.trim() }),
+        })
+        d = await r.json().catch(() => { throw new Error(`服务暂不可用（${r.status}），请稍后重试。`) })
+        if (!r.ok) {
+          if (d.browserFallback) d = await browserVideoInfo(d.resolvedUrl || value, controller.signal)
+          else throw new Error(d.error || `解析失败（${r.status}）`)
+        }
+      }
+      if (controller.signal.aborted) return
+      setVideo(d); setUrl(d.url)
+      const next = [{ url: d.url, title: d.title }, ...history.filter(x => x.url !== d.url)].slice(0, 8)
+      setHistory(next)
+      try { localStorage.setItem('bili-history', JSON.stringify(next)) } catch {}
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : '解析失败')
-    } finally { setLoading(false) }
+      if (analyzeAbort.current === controller) setError(controller.signal.aborted ? '解析超时，请稍后重试。' : e instanceof Error ? e.message : '解析失败')
+    } finally { clearTimeout(timeout); if (analyzeAbort.current === controller) { setLoading(false); analyzeAbort.current = null } }
   }
 
   async function downloadVideo() {
-    if (!video?.bvid || !video?.cid) return
-    setDownloading(true); setDownloadResult(null)
+    if (!video || downloading) return
+    const controller = new AbortController(); downloadAbort.current = controller
+    setDownloading(true); setDownloadResult(null); setActiveTab('download')
+    const timeout = setTimeout(() => controller.abort(), 65000)
     try {
       const r = await fetch('/api/download', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ bvid: video.bvid, cid: video.cid }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+        body: JSON.stringify({ url: video.url, bvid: video.bvid, cid: video.cid, quality: webQuality }),
       })
-      const contentType = r.headers.get('content-type') || ''
-      if (contentType.includes('video')) {
+      if (r.ok && (r.headers.get('content-type') || '').includes('video/')) {
         const blob = await r.blob()
-        const a = document.createElement('a')
-        a.href = URL.createObjectURL(blob)
-        a.download = `${video.title}.mp4`
-        a.click()
-        URL.revokeObjectURL(a.href)
-        setDownloadResult({ mode: 'success', message: '下载完成！检查你的下载文件夹 🎉' })
-      } else {
-        const d = await r.json()
-        if (d.mode === 'fallback') {
-          setDownloadResult(d)
-        } else {
-          setDownloadResult({ mode: 'error', message: d.error || '下载失败' })
-        }
-      }
+        const expected = Number(r.headers.get('X-Video-Size'))
+        if (!blob.size || (expected > 0 && blob.size !== expected)) throw new Error('下载在传输途中中断，请降低网页画质重试，或使用本机下载。')
+        const a = document.createElement('a'), objectUrl = URL.createObjectURL(blob)
+        a.href = objectUrl; a.download = `${video.title.replace(/[\\/:*?"<>|]/g, '_')}.mp4`
+        document.body.appendChild(a); a.click(); a.remove()
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 60000)
+        setDownloadResult({ mode: 'success', message: `视频已准备好，请在浏览器下载列表中确认保存。实际画质：${({16: '360p', 32: '480p', 64: '720p'} as Record<number, string>)[Number(r.headers.get('X-Video-Quality'))] || '平台可用画质'}。` })
+      } else setDownloadResult(await responseJson(r))
     } catch (e: unknown) {
-      setDownloadResult({ mode: 'error', message: e instanceof Error ? e.message : '下载失败' })
-    } finally { setDownloading(false) }
+      if (downloadAbort.current === controller) setDownloadResult({ mode: 'fallback', command: downloadCommand(video.url), message: controller.signal.aborted ? '网页下载超时，请使用下方本机下载指令。' : e instanceof Error ? e.message : '下载失败，请使用本机下载。' })
+    } finally { clearTimeout(timeout); if (downloadAbort.current === controller) { setDownloading(false); downloadAbort.current = null } }
   }
 
   async function generateTutorial() {
-    if (!video) return
-    setTutorialLoading(true); setTutorialText(''); setActiveTab('tutorial')
-    const subtitleUrl = video.subtitles?.[0]?.subtitle_url || ''
+    if (!video || tutorialLoading) return
+    const controller = new AbortController(); tutorialAbort.current = controller
+    setTutorialLoading(true); setTutorialText(''); setTutorialError(''); setTutorialSource(''); setTutorialStatus('正在连接 AI 服务…'); setActiveTab('tutorial')
+    const subtitleUrl = subtitleIndex === 'auto' ? video.subtitles?.[0]?.subtitle_url || '' : video.subtitles?.[Number(subtitleIndex)]?.subtitle_url || ''
+    let output = '', completed = false
+    const timeout = setTimeout(() => controller.abort(), 65000)
     try {
       const r = await fetch('/api/tutorial', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ subtitleUrl, title: video.title, description: video.description, videoUrl: video.url }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+        body: JSON.stringify({ subtitleUrl, title: `${video.title}${(video.pages?.length || 0) > 1 ? ` · P${video.selectedPage} ${video.pages?.find(p => p.page === video.selectedPage)?.title || ''}` : ''}`, videoUrl: video.url, transcript, sourceMode: subtitleIndex === 'auto' ? 'auto' : 'subtitle' }),
       })
-      if (!r.ok) { const d = await r.json(); setError(d.error || '教程生成失败'); setTutorialLoading(false); return }
-      const reader = r.body?.getReader()
-      if (!reader) return
-      const decoder = new TextDecoder()
-      let buf = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        const lines = buf.split('\n')
-        buf = lines.pop() || ''
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const payload = line.slice(6).trim()
-            if (payload === '[DONE]') continue
-            try { const { text } = JSON.parse(payload); if (text) setTutorialText(prev => prev + text) } catch { /* skip */ }
-          }
-        }
-        tutorialRef.current?.scrollTo({ top: tutorialRef.current.scrollHeight, behavior: 'smooth' })
-      }
+      if (!r.ok) { await responseJson(r); return }
+      if (!r.body || !r.headers.get('content-type')?.includes('text/event-stream')) throw new Error('AI 服务返回格式异常，请重试。')
+      await readSSE(r.body, payload => {
+        if (controller.signal.aborted) return
+        if (payload === '[DONE]') { completed = true; return }
+        let event
+        try { event = JSON.parse(payload) } catch { return }
+        if (event.error) throw new Error(event.error)
+        if (event.status) setTutorialStatus(event.status)
+        if (event.source) setTutorialSource(event.source)
+        if (event.warning) setTutorialError(event.warning)
+        if (event.text) { output += event.text; setTutorialText(output) }
+      })
+      if (!completed || !output.trim()) throw new Error('生成中断或没有返回内容，请重试。')
+      setTutorialStatus('生成完成')
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : '教程生成失败')
-    } finally { setTutorialLoading(false) }
+      if (tutorialAbort.current === controller) setTutorialError(controller.signal.aborted ? '生成已停止，已收到的内容保留在下方。' : e instanceof Error ? e.message : '教程生成失败')
+    } finally { clearTimeout(timeout); if (tutorialAbort.current === controller) { setTutorialLoading(false); tutorialAbort.current = null } }
+  }
+
+  function exportTutorial() {
+    if (!video || !tutorialText) return
+    const blob = new Blob([`# ${video.title}\n\n来源：${video.url}\n\n依据：${tutorialSource || '视频内容'}\n${tutorialError ? `\n注意：${tutorialError}\n` : ''}\n${tutorialMarkdown(tutorialText)}`], { type: 'text/markdown;charset=utf-8' })
+    const href = URL.createObjectURL(blob), a = document.createElement('a')
+    a.href = href; a.download = `${video.title.replace(/[\\/:*?"<>|]/g, '_')}-学习笔记.md`
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(href), 60000)
   }
 
   return (
@@ -164,7 +211,7 @@ export default function Home() {
       {/* ═══════════ HERO — Full viewport, extreme typography ═══════════ */}
       <section
         ref={heroRef}
-        className="hero-section relative min-h-[100vh] flex flex-col items-center justify-center px-4 sm:px-6 overflow-hidden"
+        className="hero-section relative min-h-[65vh] py-14 sm:py-20 flex flex-col items-center justify-center px-4 sm:px-6 overflow-hidden"
       >
         {/* Mouse-following glow */}
         <div className="mouse-glow" />
@@ -181,7 +228,7 @@ export default function Home() {
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--success)] opacity-75" />
               <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-[var(--success)]" />
             </span>
-            yt-dlp + AI 驱动
+            视频解析 · 字幕学习 · 本机下载
           </motion.div>
 
           {/* ─── EXTREME Title ─── */}
@@ -207,7 +254,7 @@ export default function Home() {
           >
             粘贴链接，<span className="text-[var(--text-secondary)]">解码一切</span>。
             <br />
-            <span className="text-[0.8rem]">AI 智能教程 · 离线下载 · 零门槛</span>
+            <span className="text-[0.8rem]">AI 学习笔记 · 视频下载 · 字幕来源</span>
           </motion.p>
 
           {/* ─── Search Bar — Elevated glass terminal ─── */}
@@ -218,18 +265,18 @@ export default function Home() {
           >
             <div className="search-container glass-elevated rounded-2xl p-2">
               <div className="flex gap-2">
-                <div className="relative flex-1">
+                <div className="relative flex-1 min-w-0">
                   <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-[var(--text-dim)]" />
                   <input
-                    type="text" value={url} onChange={e => setUrl(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && analyze()}
-                    placeholder="粘贴 B 站或 YouTube 视频链接..."
+                    type="text" aria-label="视频链接" autoComplete="off" spellCheck={false} value={url} onChange={e => setUrl(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && !e.nativeEvent.isComposing && !loading && analyze()}
+                    placeholder="视频链接、分享文本或 BV 号"
                     className="w-full bg-transparent pl-12 pr-4 py-4 sm:py-5 text-[var(--text-primary)] placeholder-[var(--text-dim)] outline-none text-base font-light tracking-wide"
                   />
                 </div>
                 <button
-                  onClick={analyze} disabled={loading || !url.trim()}
-                  className="btn-primary disabled:opacity-30 disabled:cursor-not-allowed disabled:transform-none px-8 sm:px-10 py-4 sm:py-5 text-sm font-semibold whitespace-nowrap rounded-xl tracking-wide uppercase"
+                  onClick={() => analyze()} disabled={loading || !url.trim()}
+                  className="btn-primary disabled:opacity-30 disabled:cursor-not-allowed disabled:transform-none px-4 sm:px-10 py-4 sm:py-5 text-sm font-semibold whitespace-nowrap rounded-xl tracking-wide uppercase"
                 >
                   {loading ? (
                     <span className="flex items-center gap-2">
@@ -241,15 +288,21 @@ export default function Home() {
               </div>
             </div>
 
+            <p className="mt-3 text-xs text-[var(--text-secondary)]">支持 B 站视频 / 分 P / 短链接，以及 YouTube 视频与 Shorts</p>
+            {history.length > 0 && <div className="mt-4 text-left glass rounded-xl p-3">
+              <div className="flex justify-between text-xs text-[var(--text-secondary)] mb-2"><span>最近解析 · 仅保存在这台设备</span><button onClick={() => { setHistory([]); try { localStorage.removeItem('bili-history') } catch {} }} className="hover:text-white">清空记录</button></div>
+              <div className="flex flex-wrap gap-2">{history.slice(0, 4).map(item => <button key={item.url} disabled={loading} onClick={() => analyze(item.url)} title={item.title} className="max-w-full truncate rounded-lg bg-white/5 px-3 py-2 text-xs text-[var(--text-secondary)] hover:text-white">{item.title}</button>)}</div>
+            </div>}
+
             {/* Feature pills — asymmetric */}
             <motion.div
               {...fadeUp}
               transition={{ ...fadeUp.transition, delay: 0.5 }}
-              className="flex items-center justify-center gap-8 mt-8 text-[11px] tracking-[0.12em] uppercase text-[var(--text-dim)] font-medium"
+              className="flex items-center justify-center gap-3 sm:gap-8 mt-5 text-[11px] tracking-[0.12em] uppercase text-[var(--text-dim)] font-medium"
             >
-              <span className="flex items-center gap-2"><Zap className="w-3 h-3 text-[var(--accent)]" />秒级解析</span>
+              <span className="flex items-center gap-2"><Zap className="w-3 h-3 text-[var(--accent)]" />链接解析</span>
               <span className="w-[1px] h-3 bg-[var(--border)]" />
-              <span className="flex items-center gap-2"><Download className="w-3 h-3 text-[var(--accent)]" />离线下载</span>
+              <span className="flex items-center gap-2"><Download className="w-3 h-3 text-[var(--accent)]" />本机下载</span>
               <span className="w-[1px] h-3 bg-[var(--border)]" />
               <span className="flex items-center gap-2"><Sparkles className="w-3 h-3 text-[var(--gold)]" />AI 教程</span>
             </motion.div>
@@ -258,16 +311,16 @@ export default function Home() {
       </section>
 
       {/* ═══════════ CONTENT AREA ═══════════ */}
-      <div className="max-w-4xl mx-auto px-4 sm:px-6 pb-32">
+      <div ref={contentRef} className="max-w-4xl mx-auto px-4 sm:px-6 pb-16 scroll-mt-6">
 
         {/* Error */}
         <AnimatePresence>
           {error && (
             <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
-              className="flex items-center gap-3 glass rounded-xl p-4 mb-6 border-[var(--danger)]/20 border">
+              role="alert" className="flex items-center gap-3 glass rounded-xl p-4 mb-6 border-[var(--danger)]/20 border">
               <AlertCircle className="w-5 h-5 text-[var(--danger)] shrink-0" />
               <span className="text-[var(--danger)] text-sm">{error}</span>
-              <button onClick={() => setError('')} className="ml-auto text-[var(--text-dim)] hover:text-white text-xs">✕</button>
+              <button aria-label="关闭错误提示" onClick={() => setError('')} className="ml-auto text-[var(--text-dim)] hover:text-white text-xs">✕</button>
             </motion.div>
           )}
         </AnimatePresence>
@@ -318,13 +371,14 @@ export default function Home() {
                     )}
                     <span className="text-sm font-medium text-[var(--text-secondary)]">{video.uploader}</span>
                     {video.url && (
-                      <a href={video.url} target="_blank" rel="noopener noreferrer"
+                      <a aria-label="打开原视频" href={video.url} target="_blank" rel="noopener noreferrer"
                         className="ml-auto text-[var(--text-dim)] hover:text-[var(--accent)] transition-colors">
                         <ExternalLink className="w-4 h-4" />
                       </a>
                     )}
                   </div>
 
+                  {(video.pages?.length || 0) > 1 && <p className="text-sm text-[var(--accent)] mb-4">当前分 P：P{video.selectedPage} · {video.pages?.find(p => p.page === video.selectedPage)?.title}</p>}
                   {/* Stats row */}
                   {video.views !== undefined && (
                     <div className="flex flex-wrap gap-2 mb-4">
@@ -353,10 +407,22 @@ export default function Home() {
                 </div>
               </div>
 
+              {(video.pages?.length || 0) > 1 && <div className="glass rounded-xl p-4">
+                <label htmlFor="part" className="text-sm mr-3">选择分 P</label>
+                <select id="part" value={video.selectedPage || 1} onChange={e => analyze(`https://www.bilibili.com/video/${video.bvid}?p=${e.target.value}`)} className="max-w-full bg-[var(--bg-deep)] p-2 rounded-lg text-sm">{video.pages?.map(p => <option key={p.cid} value={p.page}>P{p.page} · {p.title} ({fmtDur(p.duration)})</option>)}</select>
+              </div>}
+
+              <div className="glass rounded-xl p-4 text-sm">
+                <label htmlFor="quality" className="mr-3">网页下载画质</label>
+                <select id="quality" value={webQuality} disabled={downloading} onChange={e => setWebQuality(Number(e.target.value))} className="bg-[var(--bg-deep)] p-2 rounded-lg">
+                  <option value={32}>优先 480p</option><option value={16}>360p · 文件更小</option><option value={64}>优先 720p</option>
+                </select>
+                <p className="mt-2 text-xs text-[var(--text-secondary)]">以平台公开提供的实际画质为准。网页下载最多 40 MiB，更大文件或最高画质请使用本机下载。</p>
+              </div>
               {/* ─── Action Bento Grid — Asymmetric 2-col ─── */}
               <div className="grid grid-cols-2 gap-3">
                 <button
-                  onClick={downloadVideo} disabled={downloading || !video.bvid}
+                  onClick={downloadVideo} disabled={downloading}
                   className="glass glow-border rounded-2xl p-5 sm:p-6 text-left group transition-all disabled:opacity-30 hover:bg-[var(--bg-glass-hover)]"
                 >
                   <div className="flex items-center gap-3 mb-3">
@@ -368,7 +434,7 @@ export default function Home() {
                     </span>
                   </div>
                   <p className="text-xs text-[var(--text-dim)] leading-relaxed">
-                    {video.bvid ? '直接下载 MP4 到本地' : '仅支持 B 站视频'}
+                    {video.bvid ? '小文件网页下载，大文件本机下载' : '查看本机下载步骤与指令'}
                   </p>
                   {downloading && (
                     <div className="mt-4 h-1 bg-[var(--bg-glass)] rounded-full overflow-hidden">
@@ -390,7 +456,7 @@ export default function Home() {
                     </span>
                   </div>
                   <p className="text-xs text-[var(--text-dim)] leading-relaxed">
-                    {video.hasSubtitles ? '从字幕提取知识点' : '从描述智能分析'}
+                    {video.hasSubtitles ? '根据视频或所选字幕生成学习笔记' : '尝试提取视频内容，也可粘贴字幕'}
                   </p>
                   {tutorialLoading && (
                     <div className="mt-4 h-1 bg-[var(--bg-glass)] rounded-full overflow-hidden">
@@ -399,6 +465,20 @@ export default function Home() {
                   )}
                 </button>
               </div>
+
+              <details className="glass rounded-xl p-4" open={!!tutorialError}>
+                <summary className="text-sm cursor-pointer text-[var(--text-secondary)]">字幕来源 · 可选择语言或粘贴文本</summary>
+                <div className="mt-4 space-y-3">
+                  <label htmlFor="subtitle" className="block text-xs text-[var(--text-secondary)]">内容来源</label>
+                  <select id="subtitle" value={subtitleIndex} onChange={e => setSubtitleIndex(e.target.value)} disabled={tutorialLoading} className="bg-[var(--bg-deep)] rounded-lg p-2 text-sm w-full">
+                    <option value="auto">自动提取视频内容</option>{video.subtitles.map((s, i) => <option key={s.lan + i} value={i}>{s.lan_doc} · 平台字幕</option>)}
+                  </select>
+                  {video.subtitleNotice && <p className="text-xs text-[var(--text-secondary)]">{video.subtitleNotice}</p>}
+                  <label htmlFor="transcript" className="block text-xs text-[var(--text-secondary)]">粘贴实际字幕或转录文本（优先使用，最多 60000 字符）</label>
+                  <textarea id="transcript" maxLength={60000} rows={5} value={transcript} disabled={tutorialLoading} onChange={e => setTranscript(e.target.value)} placeholder="没有平台字幕？将视频的字幕或转录内容粘贴到这里，再点击 AI 教程。" className="w-full bg-[var(--bg-deep)] border border-[var(--border)] rounded-xl p-3 text-sm" />
+                  <p className="text-xs text-[var(--text-secondary)]">只根据实际内容生成笔记，不会把简介当作完整视频字幕。</p>
+                </div>
+              </details>
 
               {/* Download Result */}
               <AnimatePresence>
@@ -438,14 +518,14 @@ export default function Home() {
               </AnimatePresence>
 
               {/* ─── Tabs ─── */}
-              {(tutorialText || activeTab === 'download') && (
-                <div className="flex gap-1 p-1.5 glass rounded-xl">
+              {video && (
+                <div role="tablist" aria-label="结果内容" className="flex gap-1 p-1.5 glass rounded-xl">
                   {[
                     { key: 'download' as const, icon: FileText, label: '下载指令' },
                     { key: 'tutorial' as const, icon: Sparkles, label: 'AI 教程' },
                   ].map(tab => (
                     <button
-                      key={tab.key}
+                      key={tab.key} role="tab" aria-selected={activeTab === tab.key}
                       onClick={() => setActiveTab(tab.key)}
                       className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-lg text-sm font-medium transition-all ${activeTab === tab.key
                         ? 'bg-[var(--bg-glass-hover)] text-[var(--text-primary)] shadow-sm'
@@ -462,12 +542,20 @@ export default function Home() {
               {/* Download Commands Tab */}
               {activeTab === 'download' && (
                 <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-3">
+                  <details className="glass rounded-xl p-4" open={downloadResult?.mode === 'fallback'}>
+                    <summary className="text-sm cursor-pointer">第一次下载？先完成这两步</summary>
+                    <ol className="text-sm text-[var(--text-secondary)] list-decimal pl-5 mt-3 space-y-3">
+                      <li>安装下载工具和音视频合并工具。Mac（已安装 Homebrew）：<code className="block mt-2 p-3 bg-black/30 rounded-lg overflow-x-auto">brew install yt-dlp ffmpeg</code>Windows（PowerShell）：<code className="block mt-2 p-3 bg-black/30 rounded-lg overflow-x-auto">winget install --id yt-dlp.yt-dlp -e</code><code className="block mt-2 p-3 bg-black/30 rounded-lg overflow-x-auto">winget install --id Gyan.FFmpeg -e</code><a href="https://github.com/yt-dlp/yt-dlp#installation" target="_blank" rel="noopener noreferrer" className="inline-block mt-2 text-[var(--accent)]">查看完整安装说明</a></li>
+                      <li>复制下方指令，在终端粘贴并运行。文件保存在终端当前文件夹；最高画质通常需要 FFmpeg。</li>
+                      <li>如果提示需要登录，在指令的 <code>yt-dlp</code> 后加入 <code>--cookies-from-browser chrome</code>，并先在本机 Chrome 登录视频网站。登录状态只在本机使用。</li>
+                    </ol>
+                  </details>
                   {[
-                    { label: '最高画质', icon: '🎬', cmd: `yt-dlp -f "bestvideo+bestaudio" --merge-output-format mp4 "${video.url}"` },
-                    { label: '仅音频', icon: '🎵', cmd: `yt-dlp -x --audio-format mp3 "${video.url}"` },
-                    ...(video.platform === 'bilibili' ? [
-                      { label: '字幕', icon: '💬', cmd: `yt-dlp --write-sub --sub-lang zh-CN --skip-download "${video.url}"` },
-                    ] : []),
+                    { label: '最高画质', icon: '🎬', cmd: downloadCommand(video.url) },
+                    { label: '仅音频', icon: '🎵', cmd: downloadCommand(video.url, 'audio') },
+                    ...([
+                      { label: '字幕', icon: '💬', cmd: downloadCommand(video.url, 'subtitle') },
+                    ]),
                   ].map(item => (
                     <div key={item.label} className="glass rounded-xl p-4 hover:bg-[var(--bg-glass-hover)] transition-colors">
                       <div className="flex justify-between items-center mb-2.5">
@@ -491,24 +579,30 @@ export default function Home() {
                   ref={tutorialRef}
                   className="glass-elevated rounded-2xl p-6 sm:p-8 max-h-[70vh] overflow-y-auto"
                 >
+                  <div className="flex flex-wrap items-center justify-between gap-3 mb-4 text-xs text-[var(--text-secondary)]" role="status" aria-live="polite">
+                    <span>{tutorialLoading ? tutorialStatus : tutorialError ? '生成未完成' : tutorialText ? '生成完成' : '准备生成'}{tutorialSource && ` · ${tutorialSource}`}</span>
+                    {tutorialLoading && <button onClick={() => tutorialAbort.current?.abort()} className="text-[var(--accent)]">停止生成</button>}
+                  </div>
+                  {tutorialError && <div role="alert" className="text-sm text-[var(--danger)] mb-4">{tutorialError}<button disabled={tutorialLoading} onClick={generateTutorial} className="ml-3 underline">重试</button></div>}
                   {tutorialText ? (
                     <div className={`tutorial-content ${tutorialLoading ? 'typing-cursor' : ''}`}>
-                      <ReactMarkdown>{tutorialText}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{tutorialMarkdown(tutorialText)}</ReactMarkdown>
                     </div>
                   ) : (
                     <div className="text-center py-16 text-[var(--text-dim)]">
                       <div className="w-16 h-16 rounded-2xl bg-[var(--gold)]/5 border border-[var(--gold)]/10 flex items-center justify-center mx-auto mb-4">
                         <Sparkles className="w-7 h-7 opacity-40 text-[var(--gold)]" />
                       </div>
-                      <p className="text-sm">点击上方「AI 教程」按钮开始</p>
+                      <p className="text-sm">{tutorialLoading ? tutorialStatus : tutorialError ? '可展开「字幕来源」粘贴实际字幕后重试' : '点击上方「AI 教程」按钮开始'}</p>
                     </div>
                   )}
                   {tutorialText && !tutorialLoading && (
-                    <div className="mt-6 pt-4 border-t border-[var(--border)]">
-                      <button onClick={() => copy(tutorialText, 'tutorial')}
+                    <div className="mt-6 pt-4 flex flex-wrap gap-4 border-t border-[var(--border)]">
+                      <button onClick={() => copy(tutorialMarkdown(tutorialText), 'tutorial')}
                         className="text-sm text-[var(--accent)] hover:text-[var(--accent-bright)] flex items-center gap-2 transition-colors">
-                        {copied === 'tutorial' ? <><Check className="w-4 h-4" /> 已复制完整教程</> : <><Copy className="w-4 h-4" /> 复制完整教程 (Markdown)</>}
+                        {copied === 'tutorial' ? <><Check className="w-4 h-4" /> 已复制完整教程</> : <><Copy className="w-4 h-4" /> 复制学习笔记 (Markdown)</>}
                       </button>
+                      <button onClick={exportTutorial} className="text-sm text-[var(--accent)] flex items-center gap-2"><Download className="w-4 h-4" />导出 Markdown</button>
                     </div>
                   )}
                 </motion.div>
