@@ -4,7 +4,7 @@ import { HttpError, requestJson, errorResponse } from '../../../lib/upstream'
 import { readSSE, ThinkFilter } from '../../../lib/sse'
 
 export const maxDuration = 60
-const prompt = '请根据视频的实际内容，用中文生成适合初学者的 Markdown 学习笔记。先判断是教学、音乐、娱乐还是其他类型；仅对教学内容整理实操步骤。包含内容概览、关键知识或主题、原文支持的步骤、常见问题及总结。不要编造视频中未出现的事实、工具、参数或操作。非教学视频请写内容解读，不要虚构教程。不要输出思考过程。'
+const prompt = '请根据视频的实际内容，用中文生成适合初学者的 Markdown 学习笔记。先判断是教学、音乐、娱乐还是其他类型；仅对教学内容整理实操步骤。包含内容概览、关键知识或主题、原文支持的步骤、常见问题及总结。不要编造视频中未出现的事实、工具、参数或操作。非教学视频请写内容解读，不要虚构教程。标题仅用于标识，不得根据标题补写字幕未出现的内容。拓展建议必须明确标注“补充建议（非视频原文）”。不要用 Markdown 代码围栏包裹整篇笔记。不要输出思考过程。'
 
 export async function POST(req: NextRequest) {
   try {

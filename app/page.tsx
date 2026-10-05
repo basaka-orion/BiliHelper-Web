@@ -5,6 +5,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { downloadCommand, parseVideoLink } from '../lib/video-url'
 import { readSSE } from '../lib/sse'
+import { tutorialMarkdown } from '../lib/markdown'
 import { browserVideoInfo, browserMediaInfo } from '../lib/browser-bili'
 import { Search, Download, Sparkles, Copy, Check, AlertCircle, Clock, Eye, ThumbsUp, MessageCircle, ChevronDown, ChevronUp, Zap, FileText, ExternalLink } from 'lucide-react'
 
@@ -211,7 +212,7 @@ export default function Home() {
 
   function exportTutorial() {
     if (!video || !tutorialText) return
-    const blob = new Blob([`# ${video.title}\n\n来源：${video.url}\n\n依据：${tutorialSource || '视频内容'}\n${tutorialError ? `\n注意：${tutorialError}\n` : ''}\n${tutorialText}`], { type: 'text/markdown;charset=utf-8' })
+    const blob = new Blob([`# ${video.title}\n\n来源：${video.url}\n\n依据：${tutorialSource || '视频内容'}\n${tutorialError ? `\n注意：${tutorialError}\n` : ''}\n${tutorialMarkdown(tutorialText)}`], { type: 'text/markdown;charset=utf-8' })
     const href = URL.createObjectURL(blob), a = document.createElement('a')
     a.href = href; a.download = `${video.title.replace(/[\\/:*?"<>|]/g, '_')}-学习笔记.md`
     document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(href), 60000)
@@ -591,7 +592,7 @@ export default function Home() {
                   {tutorialError && <div role="alert" className="text-sm text-[var(--danger)] mb-4">{tutorialError}<button disabled={tutorialLoading} onClick={generateTutorial} className="ml-3 underline">重试</button></div>}
                   {tutorialText ? (
                     <div className={`tutorial-content ${tutorialLoading ? 'typing-cursor' : ''}`}>
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{tutorialText}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{tutorialMarkdown(tutorialText)}</ReactMarkdown>
                     </div>
                   ) : (
                     <div className="text-center py-16 text-[var(--text-dim)]">
@@ -603,7 +604,7 @@ export default function Home() {
                   )}
                   {tutorialText && !tutorialLoading && (
                     <div className="mt-6 pt-4 flex flex-wrap gap-4 border-t border-[var(--border)]">
-                      <button onClick={() => copy(tutorialText, 'tutorial')}
+                      <button onClick={() => copy(tutorialMarkdown(tutorialText), 'tutorial')}
                         className="text-sm text-[var(--accent)] hover:text-[var(--accent-bright)] flex items-center gap-2 transition-colors">
                         {copied === 'tutorial' ? <><Check className="w-4 h-4" /> 已复制完整教程</> : <><Copy className="w-4 h-4" /> 复制学习笔记 (Markdown)</>}
                       </button>

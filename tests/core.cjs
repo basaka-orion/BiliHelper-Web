@@ -46,3 +46,10 @@ test('selects the actual cid and duration for a multi-part video and rejects mis
   assert.equal(result.cid, 2); assert.equal(result.duration, 200); assert.equal(result.url, 'https://www.bilibili.com/video/BV1wD4y1o7AS?p=2')
   assert.throws(() => biliMetadata(video, 3))
 })
+
+const { tutorialMarkdown } = require(path.join(compiled, 'markdown.js'))
+test('renders provider Markdown wrappers while retaining nested programming examples', () => {
+  const document = '# 标题\n\n```python\nprint("ok")\n```'
+  assert.equal(tutorialMarkdown('```markdown\n' + document + '\n```'), document)
+  assert.equal(tutorialMarkdown('```python\nprint("ok")\n```'), '```python\nprint("ok")\n```')
+})

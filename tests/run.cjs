@@ -4,7 +4,7 @@ const { join } = require('node:path')
 const { spawnSync } = require('node:child_process')
 const directory = mkdtempSync(join(tmpdir(), 'bili-tests-'))
 try {
-  let result = spawnSync(process.execPath, ['node_modules/typescript/bin/tsc', 'lib/video-url.ts', 'lib/sse.ts', 'lib/bili-metadata.ts', '--target', 'es2022', '--module', 'commonjs', '--outDir', directory, '--skipLibCheck'], { stdio: 'inherit' })
+  let result = spawnSync(process.execPath, ['node_modules/typescript/bin/tsc', 'lib/video-url.ts', 'lib/sse.ts', 'lib/bili-metadata.ts', 'lib/markdown.ts', '--target', 'es2022', '--module', 'commonjs', '--outDir', directory, '--skipLibCheck'], { stdio: 'inherit' })
   if (!result.status) result = spawnSync(process.execPath, ['--test', 'tests/core.cjs'], { stdio: 'inherit', env: { ...process.env, BILI_TEST_BUILD: directory } })
   process.exitCode = result.status || 0
 } finally { rmSync(directory, { recursive: true, force: true }) }
