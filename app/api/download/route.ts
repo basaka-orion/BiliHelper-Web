@@ -6,9 +6,10 @@ export const maxDuration = 60
 
 export async function POST(req: NextRequest) {
   try {
-    const { url, bvid, cid, mediaUrl } = await req.json()
+    const { url, bvid, cid, mediaUrl, quality } = await req.json()
     let link
     try { link = parseVideoLink(url || bvid) } catch (e) { throw new HttpError((e as Error).message, 400) }
+    const qn = [16, 32, 64].includes(Number(quality)) ? Number(quality) : 32
     const fallback = (message: string, extra = {}) => Response.json({ mode: 'fallback', message, command: downloadCommand(link.url), ...extra })
     if (mediaUrl) {
       let media
@@ -25,8 +26,8 @@ export async function POST(req: NextRequest) {
     // Both identifiers were parsed from the official platform; the playback API validates availability.
     let playData
     try {
-      try { playData = await biliWbiJson('/x/player/wbi/playurl', { bvid: link.bvid, cid, qn: 64, fnval: 1, fnver: 0, fourk: 0, platform: 'html5' }) }
-      catch { playData = await biliJson(`/x/player/playurl?bvid=${link.bvid}&cid=${cid}&qn=64&fnval=1&fnver=0&fourk=0&platform=html5`) }
+      try { playData = await biliWbiJson('/x/player/wbi/playurl', { bvid: link.bvid, cid, qn, fnval: 1, fnver: 0, fourk: 0, platform: 'html5' }) }
+      catch { playData = await biliJson(`/x/player/playurl?bvid=${link.bvid}&cid=${cid}&qn=${qn}&fnval=1&fnver=0&fourk=0&platform=html5`) }
     } catch (e) {
       if (e instanceof HttpError && e.status === 400) throw e
       return fallback('平台暂未提供可直接下载的视频流，请使用本机下载；如提示登录，可按下方说明使用浏览器登录状态。')
@@ -43,7 +44,7 @@ export async function POST(req: NextRequest) {
     if (!response.ok || !response.body) return fallback('网页下载暂不可用，请使用本机下载。')
     const type = response.headers.get('content-type') || ''
     if (/text|json|html/.test(type)) { await response.body.cancel(); return fallback('平台视频验证未通过，请使用本机下载。') }
-    return new Response(response.body, { headers: { 'Content-Type': 'video/mp4', 'Content-Disposition': `attachment; filename="${link.bvid}.mp4"`, 'Cache-Control': 'no-store' } })
+    return new Response(response.body, { headers: { 'Content-Type': 'video/mp4', 'Content-Disposition': `attachment; filename="${link.bvid}.mp4"`, 'Cache-Control': 'no-store', 'X-Video-Quality': String(playData.quality || qn) } })
   } catch (e) { return errorResponse(e) }
 }
 

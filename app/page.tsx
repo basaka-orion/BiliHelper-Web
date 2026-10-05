@@ -64,6 +64,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [video, setVideo] = useState<VideoInfo | null>(null)
+  const [webQuality, setWebQuality] = useState(32)
   const [downloading, setDownloading] = useState(false)
   const [downloadResult, setDownloadResult] = useState<{ mode: string; command?: string; message?: string } | null>(null)
   const [tutorialText, setTutorialText] = useState('')
@@ -147,7 +148,7 @@ export default function Home() {
     try {
       if (video.bvid && video.cid) {
         try {
-          const media = await browserMediaInfo(video.bvid, video.cid, controller.signal)
+          const media = await browserMediaInfo(video.bvid, video.cid, controller.signal, webQuality)
           if (media) {
             const ready = await responseJson(await fetch('/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal, body: JSON.stringify({ url: video.url, bvid: video.bvid, cid: video.cid, mediaUrl: media.url }) }))
             if (ready.mode !== 'ready') { setDownloadResult(ready); return }
@@ -162,7 +163,7 @@ export default function Home() {
       }
       const r = await fetch('/api/download', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-        body: JSON.stringify({ url: video.url, bvid: video.bvid, cid: video.cid }),
+        body: JSON.stringify({ url: video.url, bvid: video.bvid, cid: video.cid, quality: webQuality }),
       })
       if (r.ok && (r.headers.get('content-type') || '').includes('video/')) {
         const blob = await r.blob()
@@ -171,7 +172,7 @@ export default function Home() {
         a.href = objectUrl; a.download = `${video.title.replace(/[\\/:*?"<>|]/g, '_')}.mp4`
         document.body.appendChild(a); a.click(); a.remove()
         setTimeout(() => URL.revokeObjectURL(objectUrl), 60000)
-        setDownloadResult({ mode: 'success', message: '视频已准备好，请在浏览器下载列表中确认保存。' })
+        setDownloadResult({ mode: 'success', message: `视频已准备好，请在浏览器下载列表中确认保存。实际画质：${({16: '360p', 32: '480p', 64: '720p'} as Record<number, string>)[Number(r.headers.get('X-Video-Quality'))] || '平台可用画质'}。` })
       } else setDownloadResult(await responseJson(r))
     } catch (e: unknown) {
       if (downloadAbort.current === controller) setDownloadResult({ mode: 'fallback', command: downloadCommand(video.url), message: controller.signal.aborted ? '网页下载超时，请使用下方本机下载指令。' : e instanceof Error ? e.message : '下载失败，请使用本机下载。' })
@@ -425,6 +426,13 @@ export default function Home() {
                 <select id="part" value={video.selectedPage || 1} onChange={e => analyze(`https://www.bilibili.com/video/${video.bvid}?p=${e.target.value}`)} className="max-w-full bg-[var(--bg-deep)] p-2 rounded-lg text-sm">{video.pages?.map(p => <option key={p.cid} value={p.page}>P{p.page} · {p.title} ({fmtDur(p.duration)})</option>)}</select>
               </div>}
 
+              <div className="glass rounded-xl p-4 text-sm">
+                <label htmlFor="quality" className="mr-3">网页下载画质</label>
+                <select id="quality" value={webQuality} disabled={downloading} onChange={e => setWebQuality(Number(e.target.value))} className="bg-[var(--bg-deep)] p-2 rounded-lg">
+                  <option value={32}>优先 480p</option><option value={16}>360p · 文件更小</option><option value={64}>优先 720p</option>
+                </select>
+                <p className="mt-2 text-xs text-[var(--text-secondary)]">以平台公开提供的实际画质为准。网页下载最多 40 MiB，更大文件或最高画质请使用本机下载。</p>
+              </div>
               {/* ─── Action Bento Grid — Asymmetric 2-col ─── */}
               <div className="grid grid-cols-2 gap-3">
                 <button
