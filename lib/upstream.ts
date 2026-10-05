@@ -29,3 +29,18 @@ export function errorResponse(error: unknown) {
   const status = error instanceof HttpError ? error.status : error instanceof SyntaxError ? 400 : 500
   return Response.json({ error: error instanceof HttpError ? error.message : status === 400 ? '请求格式不正确' : '服务暂时不可用，请稍后重试' }, { status })
 }
+
+export async function biliWbiJson(path: string, parameters: Record<string, string | number>) {
+  const { createHash } = await import('node:crypto')
+  const nav = await requestJson('https://api.bilibili.com/x/web-interface/nav', { headers: biliHeaders }, 'B 站签名服务', 6000)
+  const images = nav.data?.wbi_img
+  if (!images?.img_url || !images?.sub_url) throw new HttpError('B 站签名服务暂不可用')
+  const lookup = [images.img_url, images.sub_url].map((url: string) => new URL(url).pathname.split('/').pop()?.split('.')[0] || '').join('')
+  const order = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13]
+  const key = order.map(i => lookup[i]).join('')
+  if (key.length !== 32) throw new HttpError('B 站签名信息无效')
+  const params = { ...parameters, wts: Math.floor(Date.now() / 1000) }
+  const query = Object.entries(params).sort(([a], [b]) => a.localeCompare(b)).map(([k,v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v).replace(/[!'()*]/g, ''))}`).join('&')
+  const signed = `${query}&w_rid=${createHash('md5').update(query + key).digest('hex')}`
+  return biliJson(`${path}?${signed}`)
+}
