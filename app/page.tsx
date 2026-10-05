@@ -2,9 +2,10 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { downloadCommand, parseVideoLink } from '../lib/video-url'
 import { readSSE } from '../lib/sse'
-import { browserVideoInfo } from '../lib/browser-bili'
+import { browserVideoInfo, browserMediaInfo } from '../lib/browser-bili'
 import { Search, Download, Sparkles, Copy, Check, AlertCircle, Clock, Eye, ThumbsUp, MessageCircle, ChevronDown, ChevronUp, Zap, FileText, ExternalLink } from 'lucide-react'
 
 /* ─── Types ─── */
@@ -143,6 +144,21 @@ export default function Home() {
     setDownloading(true); setDownloadResult(null); setActiveTab('download')
     const timeout = setTimeout(() => controller.abort(), 50000)
     try {
+      if (video.bvid && video.cid) {
+        try {
+          const media = await browserMediaInfo(video.bvid, video.cid, controller.signal)
+          if (media) {
+            const ready = await responseJson(await fetch('/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal, body: JSON.stringify({ url: video.url, bvid: video.bvid, cid: video.cid, mediaUrl: media.url }) }))
+            if (ready.mode !== 'ready') { setDownloadResult(ready); return }
+            const a = document.createElement('a')
+            a.href = `/api/download?media=${encodeURIComponent(media.url)}&name=${video.bvid}-P${video.selectedPage || 1}`
+            a.download = `${video.bvid}-P${video.selectedPage || 1}.mp4`
+            document.body.appendChild(a); a.click(); a.remove()
+            setDownloadResult({ mode: 'success', message: '已开始网页下载，请在浏览器下载列表确认完成。网页使用平台公开提供的画质；最高画质请使用本机指令。' })
+            return
+          }
+        } catch (e) { if (controller.signal.aborted) throw e }
+      }
       const r = await fetch('/api/download', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
         body: JSON.stringify({ url: video.url, bvid: video.bvid, cid: video.cid }),
@@ -250,7 +266,7 @@ export default function Home() {
           >
             粘贴链接，<span className="text-[var(--text-secondary)]">解码一切</span>。
             <br />
-            <span className="text-[0.8rem]">AI 智能教程 · 本机下载 · 零门槛</span>
+            <span className="text-[0.8rem]">AI 学习笔记 · 视频下载 · 字幕来源</span>
           </motion.p>
 
           {/* ─── Search Bar — Elevated glass terminal ─── */}
@@ -575,7 +591,7 @@ export default function Home() {
                   {tutorialError && <div role="alert" className="text-sm text-[var(--danger)] mb-4">{tutorialError}<button disabled={tutorialLoading} onClick={generateTutorial} className="ml-3 underline">重试</button></div>}
                   {tutorialText ? (
                     <div className={`tutorial-content ${tutorialLoading ? 'typing-cursor' : ''}`}>
-                      <ReactMarkdown>{tutorialText}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{tutorialText}</ReactMarkdown>
                     </div>
                   ) : (
                     <div className="text-center py-16 text-[var(--text-dim)]">

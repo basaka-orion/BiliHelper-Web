@@ -35,3 +35,13 @@ export async function browserVideoInfo(input: string, signal: AbortSignal) {
   } catch { if (signal.aborted) throw new Error('请求已停止'); info.subtitleNotice = '平台字幕暂不可用，可粘贴实际字幕文本。' }
   return info
 }
+
+export async function browserMediaInfo(bvid: string, cid: number, signal: AbortSignal) {
+  if (!/^BV[0-9A-Za-z]{10}$/.test(bvid) || !Number.isSafeInteger(cid) || cid <= 0) throw new Error('视频信息无效')
+  const data = await jsonp<{ quality: number; durl?: { url: string; size: number }[] }>(`/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=64&fnval=1&fnver=0&fourk=0&platform=html5`, signal)
+  const parts = data.durl || []
+  if (parts.length !== 1 || !parts[0].size || parts[0].size > 40 * 1024 * 1024) return null
+  const url = trustedAsset(parts[0].url, 'media')
+  if (!url.pathname.endsWith('.mp4')) return null
+  return { url: url.href, size: parts[0].size, quality: data.quality }
+}
