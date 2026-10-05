@@ -167,7 +167,8 @@ export default function Home() {
       })
       if (r.ok && (r.headers.get('content-type') || '').includes('video/')) {
         const blob = await r.blob()
-        if (!blob.size) throw new Error('下载内容为空，请重试。')
+        const expected = Number(r.headers.get('X-Video-Size'))
+        if (!blob.size || (expected > 0 && blob.size !== expected)) throw new Error('下载在传输途中中断，请降低网页画质重试，或使用本机下载。')
         const a = document.createElement('a'), objectUrl = URL.createObjectURL(blob)
         a.href = objectUrl; a.download = `${video.title.replace(/[\\/:*?"<>|]/g, '_')}.mp4`
         document.body.appendChild(a); a.click(); a.remove()

@@ -40,11 +40,11 @@ export async function POST(req: NextRequest) {
     let videoUrl
     try { videoUrl = trustedAsset(part.url, 'media') } catch { return fallback('平台没有提供受支持的视频地址，请使用本机下载。') }
     if (!videoUrl.pathname.endsWith('.mp4')) return fallback('该视频需要转换格式，请使用本机下载生成 MP4。')
-    const response = await fetch(videoUrl, { headers: biliHeaders, redirect: 'error', signal: AbortSignal.timeout(20000) })
+    const response = await fetch(videoUrl, { headers: { ...biliHeaders, Range: 'bytes=0-' }, redirect: 'error', signal: AbortSignal.timeout(50000) })
     if (!response.ok || !response.body) return fallback('网页下载暂不可用，请使用本机下载。')
     const type = response.headers.get('content-type') || ''
     if (/text|json|html/.test(type)) { await response.body.cancel(); return fallback('平台视频验证未通过，请使用本机下载。') }
-    return new Response(response.body, { headers: { 'Content-Type': 'video/mp4', 'Content-Disposition': `attachment; filename="${link.bvid}.mp4"`, 'Cache-Control': 'no-store', 'X-Video-Quality': String(playData.quality || qn) } })
+    return new Response(response.body, { headers: { 'Content-Type': 'video/mp4', 'Content-Disposition': `attachment; filename="${link.bvid}.mp4"`, 'Cache-Control': 'no-store', 'X-Video-Quality': String(playData.quality || qn), 'X-Video-Size': String(size), 'Content-Length': String(size) } })
   } catch (e) { return errorResponse(e) }
 }
 
@@ -61,7 +61,7 @@ export async function GET(req: NextRequest) {
     const abort = new AbortController()
     timer = setTimeout(() => abort.abort(), 55000)
     req.signal.addEventListener('abort', () => abort.abort(), { once: true })
-    const response = await fetch(url, { headers: biliHeaders, redirect: 'error', signal: abort.signal })
+    const response = await fetch(url, { headers: { ...biliHeaders, Range: 'bytes=0-' }, redirect: 'error', signal: abort.signal })
     const size = Number(response.headers.get('content-length'))
     if (!response.ok || !response.body || !size || size > 40 * 1024 * 1024 || /text|json|html/.test(response.headers.get('content-type') || '')) {
       clearTimeout(timer); await response.body?.cancel(); throw new HttpError('网页无法下载此文件，请使用页面中的本机下载指令', 400)
@@ -80,6 +80,6 @@ export async function GET(req: NextRequest) {
       },
       async cancel() { clearTimeout(timer); abort.abort(); await reader.cancel().catch(() => {}) },
     })
-    return new Response(stream, { headers: { 'Content-Type': 'video/mp4', 'Content-Disposition': `attachment; filename="${filename}.mp4"`, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } })
+    return new Response(stream, { headers: { 'Content-Type': 'video/mp4', 'Content-Disposition': `attachment; filename="${filename}.mp4"`, 'Cache-Control': 'no-store', 'Content-Length': String(size), 'X-Content-Type-Options': 'nosniff' } })
   } catch (e) { clearTimeout(timer); return errorResponse(e) }
 }
