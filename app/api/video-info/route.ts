@@ -1,4 +1,6 @@
 import { NextRequest } from 'next/server'
+import { biliMetadata } from '../../../lib/bili-metadata'
+import type { VideoLink } from '../../../lib/video-url'
 import { parseVideoLink, trustedAsset } from '../../../lib/video-url'
 import { biliJson, biliHeaders, requestJson, HttpError, errorResponse } from '../../../lib/upstream'
 
@@ -30,11 +32,13 @@ async function pageMetadata(url: string) {
 }
 
 export async function POST(req: NextRequest) {
+  let resolvedLink: VideoLink | undefined
   try {
     const body = await req.json()
     let link
     try { link = parseVideoLink(body.url) } catch (e) { throw new HttpError((e as Error).message, 400) }
     if (link.short) link = await resolveShort(link.url)
+    resolvedLink = link
     if (link.platform === 'youtube') {
       let data
       try { data = await requestJson(`https://www.youtube.com/oembed?url=${encodeURIComponent(link.url)}&format=json`, {}, 'YouTube', 5000) }
@@ -48,10 +52,9 @@ export async function POST(req: NextRequest) {
       if (error instanceof HttpError && error.status === 404) throw error
       v = await pageMetadata(link.url)
     }
-    const pages = (v.pages || []).map((p: { cid: number; page: number; part: string; duration: number }) => ({ cid: p.cid, page: p.page, title: p.part, duration: p.duration }))
-    const selected = pages.find((p: { page: number }) => p.page === link.page)
-    if (pages.length && !selected) throw new HttpError('该视频没有这个分 P，请检查链接中的 p 参数', 400)
-    const cid = selected?.cid || v.cid
+    let info
+    try { info = biliMetadata(v, link.page) } catch (e) { throw new HttpError((e as Error).message, 400) }
+    const cid = info.cid
     let subtitles = []
     let subtitleNotice = ''
     try {
@@ -60,6 +63,9 @@ export async function POST(req: NextRequest) {
         try { return [{ lan: s.lan, lan_doc: s.lan_doc, subtitle_url: trustedAsset(s.subtitle_url, 'subtitle').href }] } catch { return [] }
       })
     } catch { subtitleNotice = '平台字幕暂不可用，可粘贴字幕文本或让 AI 服务尝试提取。' }
-    return Response.json({ platform: 'bilibili', title: v.title, uploader: v.owner?.name || '未知 UP 主', avatar: v.owner?.face, duration: selected?.duration || v.duration, views: v.stat?.view, likes: v.stat?.like, coins: v.stat?.coin, favorites: v.stat?.favorite, danmakus: v.stat?.danmaku, description: v.desc, thumbnail: v.pic, bvid: v.bvid, cid, aid: v.aid, url: `https://www.bilibili.com/video/${v.bvid}${link.page > 1 ? `?p=${link.page}` : ''}`, subtitles, hasSubtitles: subtitles.length > 0, subtitleNotice, pages, selectedPage: link.page })
-  } catch (e) { return errorResponse(e) }
+    return Response.json({ ...info, subtitles, hasSubtitles: subtitles.length > 0, subtitleNotice })
+  } catch (e) {
+    if (resolvedLink?.platform === 'bilibili' && e instanceof HttpError && e.status === 502) return Response.json({ error: e.message, browserFallback: true, resolvedUrl: resolvedLink.url }, { status: 502 })
+    return errorResponse(e)
+  }
 }

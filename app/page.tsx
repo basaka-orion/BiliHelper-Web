@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
 import { downloadCommand } from '../lib/video-url'
 import { readSSE } from '../lib/sse'
+import { browserVideoInfo } from '../lib/browser-bili'
 import { Search, Download, Sparkles, Copy, Check, AlertCircle, Clock, Eye, ThumbsUp, MessageCircle, ChevronDown, ChevronUp, Zap, FileText, ExternalLink } from 'lucide-react'
 
 /* ─── Types ─── */
@@ -114,7 +115,11 @@ export default function Home() {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
         body: JSON.stringify({ url: value.trim() }),
       })
-      const d = await responseJson(r)
+      let d = await r.json().catch(() => { throw new Error(`服务暂不可用（${r.status}），请稍后重试。`) })
+      if (!r.ok) {
+        if (d.browserFallback) d = await browserVideoInfo(d.resolvedUrl || value, controller.signal)
+        else throw new Error(d.error || `解析失败（${r.status}）`)
+      }
       if (controller.signal.aborted) return
       setVideo(d); setUrl(d.url)
       const next = [{ url: d.url, title: d.title }, ...history.filter(x => x.url !== d.url)].slice(0, 8)

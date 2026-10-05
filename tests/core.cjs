@@ -38,3 +38,11 @@ test('think filter handles every possible chunk boundary, multiple blocks and un
   const f=new ThinkFilter(); let out=''; for (const char of input) out+=f.push(char); assert.equal(out+f.push('',true),'开头正文结尾')
   const g=new ThinkFilter(); assert.equal(g.push('<think>private',true),'')
 })
+
+const { biliMetadata } = require(path.join(compiled, 'bili-metadata.js'))
+test('selects the actual cid and duration for a multi-part video and rejects missing parts', () => {
+  const video = { bvid: 'BV1wD4y1o7AS', title: 'Course', cid: 1, duration: 100, pages: [{ page: 1, cid: 1, part: 'Intro', duration: 100 }, { page: 2, cid: 2, part: 'Install', duration: 200 }] }
+  const result = biliMetadata(video, 2)
+  assert.equal(result.cid, 2); assert.equal(result.duration, 200); assert.equal(result.url, 'https://www.bilibili.com/video/BV1wD4y1o7AS?p=2')
+  assert.throws(() => biliMetadata(video, 3))
+})
