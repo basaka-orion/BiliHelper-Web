@@ -46,6 +46,7 @@ async function requestAutomaticTranscript(
   token: string,
   signal: AbortSignal,
   budget: AbortSignal,
+  videoId: string,
 ) {
   const primaryTimeout = deadline(90000, AbortSignal.any([signal, budget]));
   const query = new URLSearchParams({ url: videoUrl }).toString();
@@ -73,6 +74,7 @@ async function requestAutomaticTranscript(
       (!connectionFailure && !(status >= 500 && status <= 599))
     )
       throw error;
+    logSourceFailure("automatic-primary", error, primaryTimeout.signal.aborted, videoId);
     primaryTimeout.dispose();
     // Both destinations are fixed official hosts. Never follow a redirect with credentials.
     return await requestJson(
@@ -86,7 +88,7 @@ async function requestAutomaticTranscript(
 }
 
 function logSourceFailure(
-  stage: "platform" | "automatic",
+  stage: "platform" | "automatic" | "automatic-primary",
   error: unknown,
   timedOut: boolean,
   videoId: string,
@@ -181,6 +183,12 @@ export async function POST(req: NextRequest) {
     const encoder = new TextEncoder();
     const abort = deadline(165000, req.signal);
     let canceled = false;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const stopHeartbeat = () => {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    };
+    abort.signal.addEventListener("abort", stopHeartbeat, { once: true });
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const send = (payload: unknown) => {
@@ -191,6 +199,11 @@ export async function POST(req: NextRequest) {
               ),
             );
         };
+        if (!abort.signal.aborted)
+          heartbeat = setInterval(() => {
+            if (!canceled && !abort.signal.aborted)
+              controller.enqueue(encoder.encode(": keepalive\n\n"));
+          }, 15000);
         try {
           const manual = typeof transcript === "string" && !!transcript.trim();
           let cues: SourceCue[] = manual ? parseTranscript(transcript) : [];
@@ -253,6 +266,7 @@ export async function POST(req: NextRequest) {
                 bibiToken,
                 abort.signal,
                 extractionTimeout.signal,
+                videoId,
               );
               const extracted = automaticSourceCues(
                 response.detail?.subtitlesArray,
@@ -420,12 +434,15 @@ export async function POST(req: NextRequest) {
                 : "生成失败，请重试。",
           });
         } finally {
+          stopHeartbeat();
+          abort.signal.removeEventListener("abort", stopHeartbeat);
           abort.dispose();
           if (!canceled) controller.close();
         }
       },
       cancel() {
         canceled = true;
+        stopHeartbeat();
         abort.abort();
       },
     });

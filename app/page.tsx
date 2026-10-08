@@ -285,9 +285,10 @@ export default function Home() {
       const nextId = documentId(metadata.url);
       let refreshedIndex: string | undefined;
       if (refresh && metadata.platform === "bilibili") {
+        const previous = current.current.documents[nextId];
         const refreshed = await refreshVideoSource(
           metadata,
-          current.current.documents[nextId]?.subtitleIndex || "auto",
+          previous?.subtitleIndex || "auto",
           controller.signal,
           browserSubtitles,
           async (url, signal) =>
@@ -299,6 +300,7 @@ export default function Home() {
                 body: JSON.stringify({ url }),
               }),
             ),
+          previous?.video.subtitles[Number(previous.subtitleIndex)]?.lan,
         );
         metadata = refreshed.video;
         refreshedIndex = refreshed.selected;

@@ -186,7 +186,7 @@ function tutorialRoute({
       );
     throw new Error(`Unexpected route dependency: ${name}`);
   };
-  new Function("require", "module", "exports", "process", "fetch", "setTimeout", "clearTimeout", "console", outputText)(
+  new Function("require", "module", "exports", "process", "fetch", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "console", outputText)(
     localRequire,
     module,
     module.exports,
@@ -199,6 +199,8 @@ function tutorialRoute({
     fetch,
     timers?.setTimeout || setTimeout,
     timers?.clearTimeout || clearTimeout,
+    timers?.setInterval || setInterval,
+    timers?.clearInterval || clearInterval,
     { warn: (...values) => logs.push(values) },
   );
   return Object.assign(module.exports.POST, { maxDuration: module.exports.maxDuration });
@@ -224,7 +226,7 @@ async function routeEvents(post, body, signal = new AbortController().signal) {
 }
 
 function controlledTimers() {
-  const active = new Map(), created = [];
+  const active = new Map(), intervals = new Map(), created = [];
   let nextId = 0;
   return {
     created,
@@ -235,6 +237,17 @@ function controlledTimers() {
       return id;
     },
     clearTimeout: id => active.delete(id),
+    setInterval: (callback, milliseconds) => {
+      const id = ++nextId;
+      intervals.set(id, { callback, milliseconds });
+      return id;
+    },
+    clearInterval: id => intervals.delete(id),
+    tick: milliseconds => {
+      const interval = [...intervals.values()].find(timer => timer.milliseconds === milliseconds);
+      assert.ok(interval, `missing ${milliseconds} ms interval`);
+      interval.callback();
+    },
     fire: milliseconds => {
       const entry = [...active].find(([, timer]) => timer.milliseconds === milliseconds);
       assert.ok(entry, `missing ${milliseconds} ms deadline`);
@@ -242,6 +255,7 @@ function controlledTimers() {
       entry[1].callback();
     },
     pending: () => [...active.values()].map(timer => timer.milliseconds),
+    pendingIntervals: () => [...intervals.values()].map(timer => timer.milliseconds),
   };
 }
 
@@ -355,7 +369,9 @@ test("source failure keeps safe upstream status classification without exposing 
     assert.match(message, expected);
     assert.match(message, /粘贴字幕/);
     assert.doesNotMatch(JSON.stringify(events), /raw-test-secret|secret\.invalid|test-only|test-token/);
-    assert.deepEqual(logs, [['learning-source', { stage: 'automatic', classification: 'http', httpStatus: status, videoId: 'BV1wD4y1o7AS' }]]);
+    const expectedLogs = [['learning-source', { stage: 'automatic', classification: 'http', httpStatus: status, videoId: 'BV1wD4y1o7AS' }]];
+    if (status >= 500) expectedLogs.unshift(['learning-source', { stage: 'automatic-primary', classification: 'http', httpStatus: status, videoId: 'BV1wD4y1o7AS' }]);
+    assert.deepEqual(logs, expectedLogs);
     assert.doesNotMatch(JSON.stringify(logs), /raw-test-secret|secret\.invalid|test-only|test-token/);
     assert.ok(!events.some(event => event.status?.includes('平台字幕')));
   }
@@ -574,8 +590,8 @@ test("an unavailable later-part platform source never falls back to part-one tra
   assert.ok(!events.some(event => event.text || event.evidence));
 });
 
-test("request abort and stream cancel stop extraction and clear every deadline", { timeout: 3000 }, async () => {
-  for (const mode of ['request', 'stream']) {
+test("request abort, total deadline and stream cancel stop extraction and clear every timer", { timeout: 3000 }, async () => {
+  for (const mode of ['request', 'deadline', 'stream']) {
     const timers = controlledTimers(), requestAbort = new AbortController();
     let calls = 0, extractionSignal;
     const post = tutorialRoute({
@@ -593,8 +609,14 @@ test("request abort and stream cancel stop extraction and clear every deadline",
       signal: requestAbort.signal,
     });
     assert.equal(extractionSignal.aborted, false);
+    assert.deepEqual(timers.pendingIntervals(), [15000]);
     if (mode === 'request') {
       requestAbort.abort();
+      assert.deepEqual(timers.pendingIntervals(), [], 'request abort clears heartbeat immediately');
+      await response.text();
+    } else if (mode === 'deadline') {
+      timers.fire(165000);
+      assert.deepEqual(timers.pendingIntervals(), [], 'global deadline clears heartbeat immediately');
       await response.text();
     } else {
       await response.body.cancel();
@@ -602,5 +624,63 @@ test("request abort and stream cancel stop extraction and clear every deadline",
     assert.equal(extractionSignal.aborted, true);
     assert.equal(calls, 1);
     assert.deepEqual(timers.pending(), []);
+    assert.deepEqual(timers.pendingIntervals(), []);
   }
+});
+
+test("long transcription emits only SSE comment keepalives and clears them on success or failure", { timeout: 3000 }, async () => {
+  for (const succeeds of [true, false]) {
+    const timers = controlledTimers();
+    let finish;
+    const post = tutorialRoute({
+      timers,
+      requestJson: async () => new Promise((resolve, reject) => {
+        finish = () => succeeds
+          ? resolve({ success: true, detail: { subtitlesArray: [{ text: '实际视频内容。', startTime: 1, end: 5 }] } })
+          : reject(new MockHttpError('视频 AI 服务暂时无法访问（401），请稍后重试'));
+      }),
+      fetch: async () => modelResponse(),
+    });
+    const response = await post({
+      json: async () => ({ videoUrl: 'https://www.bilibili.com/video/BV1wD4y1o7AS', title: '等待转录' }),
+      signal: new AbortController().signal,
+    });
+    const reader = response.body.getReader(), decoder = new TextDecoder();
+    assert.match(decoder.decode((await reader.read()).value), /^data: /);
+    for (let count = 0; count < 2; count++) {
+      timers.tick(15000);
+      assert.equal(decoder.decode((await reader.read()).value), ': keepalive\n\n');
+    }
+    assert.deepEqual(timers.created, [165000, 110000, 90000], 'keepalive never extends a deadline');
+    finish();
+    let remaining = '';
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      remaining += decoder.decode(chunk.value);
+    }
+    assert.match(remaining, succeeds ? /\[DONE\]/ : /认证失败（401）/);
+    assert.deepEqual(timers.pending(), []);
+    assert.deepEqual(timers.pendingIntervals(), []);
+  }
+});
+
+test("a primary HTTP failure remains in safe logs when the alias later fails to connect", async () => {
+  const logs = [];
+  let requests = 0;
+  const post = tutorialRoute({
+    logs,
+    requestJson: async () => {
+      if (++requests === 1)
+        throw new MockHttpError('视频 AI 服务暂时无法访问（500），请稍后重试 upstream-private-body https://secret.invalid/test-token');
+      throw new MockHttpError('视频 AI 服务连接超时或暂时不可用，请稍后重试');
+    },
+  });
+  const { events } = await routeEvents(post, {});
+  assert.match(events.find(event => event.error).error, /连接超时或暂时不可用/);
+  assert.deepEqual(logs, [
+    ['learning-source', { stage: 'automatic-primary', classification: 'http', httpStatus: 500, videoId: 'BV1wD4y1o7AS' }],
+    ['learning-source', { stage: 'automatic', classification: 'connection', videoId: 'BV1wD4y1o7AS' }],
+  ]);
+  assert.doesNotMatch(JSON.stringify(logs), /upstream-private-body|secret\.invalid|test-token/);
 });
