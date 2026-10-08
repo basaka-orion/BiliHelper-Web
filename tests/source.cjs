@@ -151,7 +151,8 @@ function tutorialRoute({
   fetch = async () => {
     throw new Error("Unexpected AI request");
   },
-  signals = AbortSignal,
+  timers,
+  logs = [],
 } = {}) {
   const fs = require("node:fs");
   const ts = require("typescript");
@@ -185,7 +186,7 @@ function tutorialRoute({
       );
     throw new Error(`Unexpected route dependency: ${name}`);
   };
-  new Function("require", "module", "exports", "process", "fetch", "AbortSignal", outputText)(
+  new Function("require", "module", "exports", "process", "fetch", "setTimeout", "clearTimeout", "console", outputText)(
     localRequire,
     module,
     module.exports,
@@ -196,19 +197,21 @@ function tutorialRoute({
       },
     },
     fetch,
-    signals,
+    timers?.setTimeout || setTimeout,
+    timers?.clearTimeout || clearTimeout,
+    { warn: (...values) => logs.push(values) },
   );
-  return module.exports.POST;
+  return Object.assign(module.exports.POST, { maxDuration: module.exports.maxDuration });
 }
 
-async function routeEvents(post, body) {
+async function routeEvents(post, body, signal = new AbortController().signal) {
   const response = await post({
     json: async () => ({
       videoUrl: "https://www.bilibili.com/video/BV1wD4y1o7AS",
       title: "教学视频",
       ...body,
     }),
-    signal: new AbortController().signal,
+    signal,
   });
   const text = await response.text();
   return {
@@ -217,6 +220,28 @@ async function routeEvents(post, body) {
       .split("\n\n")
       .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
       .map((line) => JSON.parse(line.slice(6))),
+  };
+}
+
+function controlledTimers() {
+  const active = new Map(), created = [];
+  let nextId = 0;
+  return {
+    created,
+    setTimeout: (callback, milliseconds) => {
+      const id = ++nextId;
+      active.set(id, { callback, milliseconds });
+      created.push(milliseconds);
+      return id;
+    },
+    clearTimeout: id => active.delete(id),
+    fire: milliseconds => {
+      const entry = [...active].find(([, timer]) => timer.milliseconds === milliseconds);
+      assert.ok(entry, `missing ${milliseconds} ms deadline`);
+      active.delete(entry[0]);
+      entry[1].callback();
+    },
+    pending: () => [...active.values()].map(timer => timer.milliseconds),
   };
 }
 
@@ -234,6 +259,8 @@ test("tutorial route sends only the chosen text window and its evidence to the m
   const { response, events } = await routeEvents(post, {
     transcript: "甲".repeat(20000) + "乙".repeat(1000),
     transcriptOffset: 20000,
+    subtitleUrl: 'https://aisubtitle.hdslb.com/test.json',
+    sourceMode: 'subtitle',
   });
   assert.equal(response.status, 200);
   const evidence = events.find((event) => event.evidence).evidence;
@@ -251,12 +278,13 @@ test("tutorial route sends only the chosen text window and its evidence to the m
   assert.ok(events.some((event) => event.text?.includes("source:1")));
 });
 
-test("automatic summary has unknown coverage and cannot masquerade as a selected later segment", async () => {
+test("an explicit summary-only response remains unknown-coverage compatibility, not a new summary request", async () => {
+  const requests = [];
   const post = tutorialRoute({
-    requestJson: async () => ({
-      success: true,
-      summary: "## 本节目的\n这是自动摘要。",
-    }),
+    requestJson: async url => {
+      requests.push(url);
+      return { success: true, summary: "## 本节目的\n这是自动摘要。" };
+    },
   });
   const normal = await routeEvents(post, {});
   assert.equal(
@@ -270,6 +298,8 @@ test("automatic summary has unknown coverage and cannot masquerade as a selected
     later.events.find((event) => event.error).error,
     /没有可选择范围的原文/,
   );
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every(url => new URL(url).pathname === '/api/v1/getSubtitle'));
 });
 
 test("a later Bilibili part never invokes the automatic provider for part one", async () => {
@@ -316,7 +346,8 @@ test("source failure keeps safe upstream status classification without exposing 
     [503, /访问失败（503）/],
   ];
   for (const [status, expected] of scenarios) {
-    const post = tutorialRoute({ requestJson: async () => {
+    const logs = [];
+    const post = tutorialRoute({ logs, requestJson: async () => {
       throw new MockHttpError(`视频 AI 服务暂时无法访问（${status}），请稍后重试。raw-test-secret https://secret.invalid/?token=test-only`);
     } });
     const { events } = await routeEvents(post, {});
@@ -324,6 +355,9 @@ test("source failure keeps safe upstream status classification without exposing 
     assert.match(message, expected);
     assert.match(message, /粘贴字幕/);
     assert.doesNotMatch(JSON.stringify(events), /raw-test-secret|secret\.invalid|test-only|test-token/);
+    assert.deepEqual(logs, [['learning-source', { stage: 'automatic', classification: 'http', httpStatus: status, videoId: 'BV1wD4y1o7AS' }]]);
+    assert.doesNotMatch(JSON.stringify(logs), /raw-test-secret|secret\.invalid|test-only|test-token/);
+    assert.ok(!events.some(event => event.status?.includes('平台字幕')));
   }
 });
 
@@ -333,24 +367,30 @@ test("network and extraction timeouts remain distinct from credential failures",
   } });
   const networkResult = await routeEvents(network, {});
   assert.match(networkResult.events.find(event => event.error).error, /连接超时或暂时不可用/);
-  const timeout = new AbortController(); timeout.abort();
+  const timers = controlledTimers();
   const timedOut = tutorialRoute({
-    signals: { any: AbortSignal.any.bind(AbortSignal), timeout: () => timeout.signal },
-    requestJson: async () => { throw new MockHttpError('视频 AI 服务连接超时或暂时不可用，请稍后重试'); },
+    timers,
+    requestJson: async () => {
+      timers.fire(110000);
+      throw new MockHttpError('视频 AI 服务连接超时或暂时不可用，请稍后重试');
+    },
   });
   const timeoutResult = await routeEvents(timedOut, {});
   assert.match(timeoutResult.events.find(event => event.error).error, /响应超时/);
   assert.doesNotMatch(JSON.stringify(timeoutResult.events), /认证失败|凭据配置/);
+  assert.deepEqual(timers.pending(), []);
 });
 
 function modelResponse() {
   return new Response('data: {"choices":[{"delta":{"content":"## 关键知识\\n依据原文 [查看原文](source:1)"}}]}\n\ndata: [DONE]\n\n', { headers: { "Content-Type": "text/event-stream" } });
 }
 
-test("successful platform fallback does not report an earlier automatic authentication error", async () => {
+test("available platform subtitles run before the automatic provider and clear their deadline", async () => {
+  const requests = [], timers = controlledTimers();
   const post = tutorialRoute({
+    timers,
     requestJson: async url => {
-      if (url.includes('bibigpt')) throw new MockHttpError('视频 AI 服务暂时无法访问（401），请稍后重试');
+      requests.push(url);
       return { body: [{ content: '所选平台字幕的实际教学内容。', from: 2, to: 8 }] };
     },
     fetch: async () => modelResponse(),
@@ -359,19 +399,31 @@ test("successful platform fallback does not report an earlier automatic authenti
   assert.ok(events.some(event => event.text));
   assert.ok(!events.some(event => event.error || event.warning));
   assert.equal(events.find(event => event.evidence).evidence.kind, 'subtitle');
-  assert.doesNotMatch(JSON.stringify(events), /401|凭据配置/);
+  assert.deepEqual(requests, ['https://aisubtitle.hdslb.com/test.json']);
+  assert.deepEqual(timers.created, [165000, 8000]);
+  assert.deepEqual(timers.pending(), []);
 });
 
 test("automatic transcript timing reaches the evidence and model without guessing units", async () => {
-  let sent;
+  let sent, request;
+  const timers = controlledTimers();
   const post = tutorialRoute({
-    requestJson: async () => ({ success: true, detail: { subtitlesArray: [{ text: '设置 price 的数值。', startTime: 53.58, end: 65.08, index: 10 }] } }),
+    timers,
+    requestJson: async (url, options) => {
+      request = { url, options };
+      return { success: true, detail: { subtitlesArray: [{ text: '设置 price 的数值。', startTime: 53.58, end: 65.08, index: 10 }] } };
+    },
     fetch: async (_url, options) => { sent = JSON.parse(options.body); return modelResponse(); },
   });
   const { events } = await routeEvents(post, {});
   assert.deepEqual(events.find(event => event.evidence).evidence.cues[0], { id: '1', text: '设置 price 的数值。', start: 53.58, end: 65.08 });
   assert.match(sent.messages.at(-1).content, /"start":53\.58/);
   assert.ok(!events.some(event => event.error));
+  assert.equal(new URL(request.url).pathname, '/api/v1/getSubtitle');
+  assert.equal(request.options.method, 'GET');
+  assert.equal(post.maxDuration, 180);
+  assert.deepEqual(timers.created, [165000, 110000, 90000]);
+  assert.deepEqual(timers.pending(), []);
 });
 
 test("automatic connection and server failures use only the official alias without redirects", async () => {
@@ -380,23 +432,27 @@ test("automatic connection and server failures use only the official alias witho
     new MockHttpError('视频 AI 服务暂时无法访问（503），请稍后重试'),
   ]) {
     const requests = [];
-    const post = tutorialRoute({ requestJson: async (url, options) => {
+    const post = tutorialRoute({ fetch: async () => modelResponse(), requestJson: async (url, options) => {
       requests.push({ url, options });
       if (requests.length === 1) throw failure;
-      return { success: true, summary: '## 本节目的\n通过官方备用入口取得内容。' };
+      return { success: true, detail: { subtitlesArray: [{ text: '通过官方备用入口取得实际原文。', startTime: 0, end: 5 }] } };
     } });
     const { events } = await routeEvents(post, {});
-    assert.deepEqual(requests.map(request => request.url), [
-      'https://api.bibigpt.co/api/v1/summarizeWithConfig',
-      'https://bibigpt.co/api/v1/summarizeWithConfig',
+    assert.deepEqual(requests.map(request => new URL(request.url).origin), [
+      'https://bibigpt.co',
+      'https://api.bibigpt.co',
     ]);
-    for (const { options } of requests) {
+    for (const { url, options } of requests) {
+      const endpoint = new URL(url);
+      assert.equal(endpoint.pathname, '/api/v1/getSubtitle');
+      assert.equal(endpoint.searchParams.get('url'), 'https://www.bilibili.com/video/BV1wD4y1o7AS');
       assert.equal(options.redirect, 'error');
       assert.equal(options.headers.Authorization, 'Bearer test-token');
-      assert.equal(options.method, 'POST');
+      assert.equal(options.method, 'GET');
+      assert.equal(options.body, undefined);
     }
-    assert.equal(requests[0].options.body, requests[1].options.body);
-    assert.ok(events.some(event => event.text?.includes('官方备用入口')));
+    assert.equal(events.find(event => event.evidence).evidence.cues[0].text, '通过官方备用入口取得实际原文。');
+    assert.ok(events.some(event => event.text));
     assert.ok(!events.some(event => event.error));
   }
 });
@@ -404,9 +460,9 @@ test("automatic connection and server failures use only the official alias witho
 test("authentication, quota, rate limit, invalid output and successful responses never use the alias", async () => {
   const failures = [400, 401, 402, 403, 429].map(status => new MockHttpError(`视频 AI 服务暂时无法访问（${status}），请稍后重试`));
   failures.push(new MockHttpError('视频 AI 服务返回了验证页面，请稍后重试'), new Error('unexpected failure'));
-  for (const result of [...failures, { success: true, summary: '已有内容' }, { success: false }]) {
+  for (const result of [...failures, { success: true, detail: { subtitlesArray: [{ text: '已取得的实际视频原文。' }] } }, { success: false }]) {
     let requests = 0;
-    const post = tutorialRoute({ requestJson: async () => {
+    const post = tutorialRoute({ fetch: async () => modelResponse(), requestJson: async () => {
       requests++;
       if (result instanceof Error) throw result;
       return result;
@@ -417,55 +473,134 @@ test("authentication, quota, rate limit, invalid output and successful responses
 });
 
 test("primary timeout and alias share one total extraction budget", async () => {
-  const timers = new Map(), combined = [], requests = [];
+  const timers = controlledTimers(), requests = [];
   const post = tutorialRoute({
-    signals: {
-      timeout: milliseconds => {
-        assert.ok(!timers.has(milliseconds), 'a timeout budget must not be reset for the alias');
-        const controller = new AbortController();
-        timers.set(milliseconds, controller);
-        return controller.signal;
-      },
-      any: signals => { combined.push(signals); return AbortSignal.any(signals); },
-    },
+    timers,
     requestJson: async (url, options) => {
       requests.push(url);
       if (requests.length === 1) {
         assert.equal(options.signal.aborted, false);
-        timers.get(10000).abort();
+        timers.fire(90000);
         assert.equal(options.signal.aborted, true);
       } else {
         assert.equal(options.signal.aborted, false, 'the expired primary timeout must not abort the alias');
-        timers.get(25000).abort();
+        timers.fire(110000);
         assert.equal(options.signal.aborted, true, 'the alias must stop at the original total deadline');
       }
       throw new MockHttpError('视频 AI 服务连接超时或暂时不可用，请稍后重试');
     },
   });
   const { events } = await routeEvents(post, {});
-  assert.deepEqual([...timers.keys()], [25000, 10000]);
+  assert.deepEqual(timers.created, [165000, 110000, 90000]);
   assert.equal(requests.length, 2);
-  assert.ok(combined[0].includes(timers.get(25000).signal));
-  assert.ok(combined[1].includes(timers.get(25000).signal));
-  assert.ok(!combined[1].includes(timers.get(10000).signal));
   assert.match(events.find(event => event.error).error, /响应超时/);
+  assert.deepEqual(timers.pending(), []);
 });
 
 test("an exhausted total extraction budget never starts an alias request", async () => {
-  const budget = new AbortController();
+  const timers = controlledTimers();
   let requests = 0;
   const post = tutorialRoute({
-    signals: {
-      timeout: milliseconds => milliseconds === 25000 ? budget.signal : new AbortController().signal,
-      any: AbortSignal.any.bind(AbortSignal),
-    },
+    timers,
     requestJson: async () => {
       requests++;
-      budget.abort();
+      timers.fire(110000);
       throw new MockHttpError('视频 AI 服务连接超时或暂时不可用，请稍后重试');
     },
   });
   const { events } = await routeEvents(post, {});
   assert.equal(requests, 1);
   assert.match(events.find(event => event.error).error, /响应超时/);
+  assert.deepEqual(timers.pending(), []);
+});
+
+test("an explicitly chosen platform source failure is retained without automatic extraction", async () => {
+  const requests = [], logs = [], timers = controlledTimers();
+  const post = tutorialRoute({
+    timers, logs,
+    requestJson: async url => {
+      requests.push(url);
+      throw new MockHttpError('字幕服务暂时无法访问（403），请稍后重试 raw-private-detail');
+    },
+  });
+  const { events } = await routeEvents(post, {
+    sourceMode: 'subtitle', subtitleUrl: 'https://aisubtitle.hdslb.com/test.json',
+  });
+  assert.deepEqual(requests, ['https://aisubtitle.hdslb.com/test.json']);
+  assert.match(events.find(event => event.error).error, /所选平台字幕访问失败（403）/);
+  assert.ok(!events.some(event => event.text || event.evidence));
+  assert.doesNotMatch(JSON.stringify(events), /raw-private-detail/);
+  assert.deepEqual(logs, [['learning-source', { stage: 'platform', classification: 'http', httpStatus: 403, videoId: 'BV1wD4y1o7AS' }]]);
+  assert.deepEqual(timers.pending(), []);
+});
+
+test("auto mode can recover an unavailable platform source with same-part direct transcription", async () => {
+  const requests = [], timers = controlledTimers();
+  const post = tutorialRoute({
+    timers,
+    requestJson: async url => {
+      requests.push(url);
+      if (requests.length === 1) throw new MockHttpError('字幕服务暂时无法访问（403），请稍后重试');
+      return { success: true, detail: { subtitlesArray: [{ text: '当前视频的自动转录内容。', startTime: 0, end: 9 }] } };
+    },
+    fetch: async () => modelResponse(),
+  });
+  const { events } = await routeEvents(post, {
+    sourceMode: 'auto', subtitleUrl: 'https://aisubtitle.hdslb.com/test.json',
+  });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0], 'https://aisubtitle.hdslb.com/test.json');
+  assert.equal(new URL(requests[1]).origin, 'https://bibigpt.co');
+  assert.equal(new URL(requests[1]).pathname, '/api/v1/getSubtitle');
+  assert.equal(events.find(event => event.evidence).evidence.kind, 'automatic');
+  assert.ok(events.some(event => event.text));
+  assert.ok(!events.some(event => event.error));
+  assert.deepEqual(timers.pending(), []);
+});
+
+test("an unavailable later-part platform source never falls back to part-one transcription", async () => {
+  const requests = [];
+  const post = tutorialRoute({ requestJson: async url => {
+    requests.push(url);
+    return { body: [] };
+  } });
+  const { events } = await routeEvents(post, {
+    sourceMode: 'auto',
+    videoUrl: 'https://www.bilibili.com/video/BV1wD4y1o7AS?p=2',
+    subtitleUrl: 'https://aisubtitle.hdslb.com/part-two.json',
+  });
+  assert.deepEqual(requests, ['https://aisubtitle.hdslb.com/part-two.json']);
+  assert.match(events.find(event => event.error).error, /当前分 P/);
+  assert.ok(!events.some(event => event.text || event.evidence));
+});
+
+test("request abort and stream cancel stop extraction and clear every deadline", { timeout: 3000 }, async () => {
+  for (const mode of ['request', 'stream']) {
+    const timers = controlledTimers(), requestAbort = new AbortController();
+    let calls = 0, extractionSignal;
+    const post = tutorialRoute({
+      timers,
+      requestJson: async (_url, options) => {
+        calls++;
+        extractionSignal = options.signal;
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(new MockHttpError('视频 AI 服务连接超时或暂时不可用，请稍后重试')), { once: true });
+        });
+      },
+    });
+    const response = await post({
+      json: async () => ({ videoUrl: 'https://www.bilibili.com/video/BV1wD4y1o7AS', title: '取消测试' }),
+      signal: requestAbort.signal,
+    });
+    assert.equal(extractionSignal.aborted, false);
+    if (mode === 'request') {
+      requestAbort.abort();
+      await response.text();
+    } else {
+      await response.body.cancel();
+    }
+    assert.equal(extractionSignal.aborted, true);
+    assert.equal(calls, 1);
+    assert.deepEqual(timers.pending(), []);
+  }
 });

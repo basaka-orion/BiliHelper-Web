@@ -14,6 +14,7 @@ try {
       "lib/markdown.ts",
       "lib/learning-source.ts",
       "lib/workspace.ts",
+      "lib/refresh-video-source.ts",
       "--target",
       "es2022",
       "--module",
@@ -27,7 +28,13 @@ try {
   if (result.status === 0)
     result = spawnSync(
       process.execPath,
-      ["--test", "tests/core.cjs", "tests/source.cjs", "tests/workspace.cjs"],
+      [
+        "--test",
+        "tests/core.cjs",
+        "tests/source.cjs",
+        "tests/workspace.cjs",
+        "tests/refresh.cjs",
+      ],
       { stdio: "inherit", env: { ...process.env, BILI_TEST_BUILD: directory } },
     );
   process.exitCode = result.status ?? 1;
