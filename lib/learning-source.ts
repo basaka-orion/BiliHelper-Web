@@ -142,6 +142,16 @@ export function platformSourceCues(body: unknown): SourceCue[] {
   return cues;
 }
 
+/** BibiGPT's OpenAPI defines startTime and end in seconds. Do not infer other fields. */
+export function automaticSourceCues(body: unknown): SourceCue[] {
+  if (!Array.isArray(body)) return [];
+  return platformSourceCues(
+    body
+      .filter((row) => row && typeof row.text === "string")
+      .map((row) => ({ content: row.text, from: row.startTime, to: row.end })),
+  );
+}
+
 export function validTranscriptOffset(value: unknown): value is number {
   return (
     typeof value === "number" &&

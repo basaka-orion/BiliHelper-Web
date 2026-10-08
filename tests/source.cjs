@@ -6,6 +6,7 @@ const {
   platformSourceCues,
   buildSourceEvidence,
   automaticSourceEvidence,
+  automaticSourceCues,
   sourcePrompt,
   validTranscriptOffset,
 } = require(path.join(process.env.BILI_TEST_BUILD, "learning-source.js"));
@@ -135,6 +136,13 @@ test("invalid or unavailable ranges fail explicitly instead of analyzing another
   assert.throws(() => buildSourceEvidence([], "manual", "字幕"), /没有可分析/);
 });
 
+class MockHttpError extends Error {
+  constructor(message, status = 502) {
+    super(message);
+    this.status = status;
+  }
+}
+
 // Exercise the real route with in-memory provider boundaries, without credentials or network.
 function tutorialRoute({
   requestJson = async () => {
@@ -143,6 +151,7 @@ function tutorialRoute({
   fetch = async () => {
     throw new Error("Unexpected AI request");
   },
+  signals = AbortSignal,
 } = {}) {
   const fs = require("node:fs");
   const ts = require("typescript");
@@ -158,17 +167,11 @@ function tutorialRoute({
       },
     },
   );
-  class HttpError extends Error {
-    constructor(message, status) {
-      super(message);
-      this.status = status;
-    }
-  }
   const module = { exports: {} };
   const localRequire = (name) => {
     if (name.endsWith("/upstream"))
       return {
-        HttpError,
+        HttpError: MockHttpError,
         requestJson,
         errorResponse: (error) =>
           Response.json(
@@ -182,7 +185,7 @@ function tutorialRoute({
       );
     throw new Error(`Unexpected route dependency: ${name}`);
   };
-  new Function("require", "module", "exports", "process", "fetch", outputText)(
+  new Function("require", "module", "exports", "process", "fetch", "AbortSignal", outputText)(
     localRequire,
     module,
     module.exports,
@@ -193,6 +196,7 @@ function tutorialRoute({
       },
     },
     fetch,
+    signals,
   );
   return module.exports.POST;
 }
@@ -238,6 +242,9 @@ test("tutorial route sends only the chosen text window and its evidence to the m
   assert.equal(evidence.cues[0].text, "乙".repeat(1000));
   assert.ok(!sent.messages[1].content.includes("甲"));
   assert.match(sent.messages[0].content, /source:编号/);
+  assert.match(sent.messages[0].content, /步骤的排列序号不是原文 id/);
+  assert.match(sent.messages[0].content, /每一条关键知识、每一个操作步骤都必须/);
+  assert.match(sent.messages[0].content, /const 不保证对象或数组的内容不可修改/);
   assert.ok(events.some((event) => event.text?.includes("source:1")));
 });
 
@@ -276,4 +283,90 @@ test("a later Bilibili part never invokes the automatic provider for part one", 
   assert.equal(requested, false);
   assert.ok(!events.some((event) => event.text));
   assert.match(events.find((event) => event.error).error, /当前分 P/);
+});
+
+test("automatic captions preserve only the documented startTime and end seconds", () => {
+  assert.deepEqual(automaticSourceCues([
+    { text: "真实片段", startTime: 53.58, end: 65.08, index: 9 },
+    { text: "仅有开始", startTime: 0 },
+    { text: "倒序结束", startTime: 12, end: 8 },
+    { text: "不猜字段", start: 1500, endTime: 2000 },
+    { text: "非法时间", startTime: -1, end: Infinity },
+    { text: "不转换字符串", startTime: "20", end: 21 },
+    { text: null, startTime: 1, end: 2 },
+  ]), [
+    { id: "1", text: "真实片段", start: 53.58, end: 65.08 },
+    { id: "2", text: "仅有开始", start: 0 },
+    { id: "3", text: "倒序结束", start: 12 },
+    { id: "4", text: "不猜字段" },
+    { id: "5", text: "非法时间" },
+    { id: "6", text: "不转换字符串" },
+  ]);
+});
+
+test("source failure keeps safe upstream status classification without exposing raw details", async () => {
+  const scenarios = [
+    [401, /认证失败（401）.*凭据配置/],
+    [403, /拒绝访问（403）.*权限或可用额度/],
+    [402, /额度不足（402）/],
+    [429, /请求过于频繁（429）/],
+    [503, /访问失败（503）/],
+  ];
+  for (const [status, expected] of scenarios) {
+    const post = tutorialRoute({ requestJson: async () => {
+      throw new MockHttpError(`视频 AI 服务暂时无法访问（${status}），请稍后重试。raw-test-secret https://secret.invalid/?token=test-only`);
+    } });
+    const { events } = await routeEvents(post, {});
+    const message = events.find(event => event.error).error;
+    assert.match(message, expected);
+    assert.match(message, /粘贴字幕/);
+    assert.doesNotMatch(JSON.stringify(events), /raw-test-secret|secret\.invalid|test-only|test-token/);
+  }
+});
+
+test("network and extraction timeouts remain distinct from credential failures", async () => {
+  const network = tutorialRoute({ requestJson: async () => {
+    throw new MockHttpError('视频 AI 服务连接超时或暂时不可用，请稍后重试');
+  } });
+  const networkResult = await routeEvents(network, {});
+  assert.match(networkResult.events.find(event => event.error).error, /连接超时或暂时不可用/);
+  const timeout = new AbortController(); timeout.abort();
+  const timedOut = tutorialRoute({
+    signals: { any: AbortSignal.any.bind(AbortSignal), timeout: () => timeout.signal },
+    requestJson: async () => { throw new MockHttpError('视频 AI 服务连接超时或暂时不可用，请稍后重试'); },
+  });
+  const timeoutResult = await routeEvents(timedOut, {});
+  assert.match(timeoutResult.events.find(event => event.error).error, /响应超时/);
+  assert.doesNotMatch(JSON.stringify(timeoutResult.events), /认证失败|凭据配置/);
+});
+
+function modelResponse() {
+  return new Response('data: {"choices":[{"delta":{"content":"## 关键知识\\n依据原文 [查看原文](source:1)"}}]}\n\ndata: [DONE]\n\n', { headers: { "Content-Type": "text/event-stream" } });
+}
+
+test("successful platform fallback does not report an earlier automatic authentication error", async () => {
+  const post = tutorialRoute({
+    requestJson: async url => {
+      if (url.includes('bibigpt')) throw new MockHttpError('视频 AI 服务暂时无法访问（401），请稍后重试');
+      return { body: [{ content: '所选平台字幕的实际教学内容。', from: 2, to: 8 }] };
+    },
+    fetch: async () => modelResponse(),
+  });
+  const { events } = await routeEvents(post, { subtitleUrl: 'https://aisubtitle.hdslb.com/test.json' });
+  assert.ok(events.some(event => event.text));
+  assert.ok(!events.some(event => event.error || event.warning));
+  assert.equal(events.find(event => event.evidence).evidence.kind, 'subtitle');
+  assert.doesNotMatch(JSON.stringify(events), /401|凭据配置/);
+});
+
+test("automatic transcript timing reaches the evidence and model without guessing units", async () => {
+  let sent;
+  const post = tutorialRoute({
+    requestJson: async () => ({ success: true, detail: { subtitlesArray: [{ text: '设置 price 的数值。', startTime: 53.58, end: 65.08, index: 10 }] } }),
+    fetch: async (_url, options) => { sent = JSON.parse(options.body); return modelResponse(); },
+  });
+  const { events } = await routeEvents(post, {});
+  assert.deepEqual(events.find(event => event.evidence).evidence.cues[0], { id: '1', text: '设置 price 的数值。', start: 53.58, end: 65.08 });
+  assert.match(sent.messages[1].content, /"start":53\.58/);
+  assert.ok(!events.some(event => event.error));
 });
