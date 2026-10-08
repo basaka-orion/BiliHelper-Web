@@ -1,630 +1,1577 @@
-'use client'
-import { useState, useRef, useCallback, useEffect } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import { downloadCommand, parseVideoLink } from '../lib/video-url'
-import { readSSE } from '../lib/sse'
-import { tutorialMarkdown } from '../lib/markdown'
-import { browserVideoInfo } from '../lib/browser-bili'
-import { Search, Download, Sparkles, Copy, Check, AlertCircle, Clock, Eye, ThumbsUp, MessageCircle, ChevronDown, ChevronUp, Zap, FileText, ExternalLink } from 'lucide-react'
+"use client";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import {
+  ArrowDownToLine,
+  ArrowRight,
+  BookOpen,
+  Check,
+  ChevronDown,
+  Copy,
+  ExternalLink,
+  FileText,
+  Library,
+  Link2,
+  List,
+  Loader2,
+  Plus,
+  Search,
+  ShieldCheck,
+  Sparkles,
+  Square,
+  Trash2,
+  Undo2,
+} from "lucide-react";
+import { browserVideoInfo } from "../lib/browser-bili";
+import { parseVideoLink } from "../lib/video-url";
+import { readSSE } from "../lib/sse";
+import { tutorialMarkdown } from "../lib/markdown";
+import {
+  createDocument,
+  documentId,
+  migrateHistory,
+  type LearningDocument,
+  type LearningNote,
+  type VideoInfo,
+} from "../lib/workspace";
+import { useWorkspace } from "../lib/use-workspace";
+import {
+  parseTranscript,
+  type SourceCue,
+  type SourceEvidence,
+} from "../lib/learning-source";
+import { Modal } from "./components/modal";
+import { DownloadPanel } from "./components/download-panel";
 
-/* ─── Types ─── */
-interface VideoInfo {
-  platform: string; title: string; uploader: string; avatar?: string
-  duration?: number; views?: number; likes?: number; coins?: number
-  favorites?: number; danmakus?: number; description?: string
-  thumbnail?: string; bvid?: string; cid?: number; aid?: number
-  url: string; subtitles: { lan: string; lan_doc: string; subtitle_url: string }[]
-  hasSubtitles: boolean; subtitleNotice?: string; pages?: { cid: number; page: number; title: string; duration: number }[]; selectedPage?: number
+const EXAMPLE = "https://www.bilibili.com/video/BV1wD4y1o7AS";
+function duration(seconds = 0) {
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
 }
-
-/* ─── Helpers ─── */
-function fmt(n: number) {
-  if (n >= 1e8) return (n / 1e8).toFixed(1) + '亿'
-  if (n >= 1e4) return (n / 1e4).toFixed(1) + '万'
-  return n.toLocaleString()
+function partName(video: VideoInfo) {
+  return (
+    video.pages?.find((part) => part.page === (video.selectedPage || 1))
+      ?.title || video.title
+  );
 }
-function fmtDur(s: number) {
-  const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, sec = Math.floor(s) % 60
-  return `${h ? `${h}:${String(m).padStart(2, '0')}` : m}:${String(sec).padStart(2, '0')}`
+function partUrl(video: VideoInfo, part: number) {
+  return `https://www.bilibili.com/video/${video.bvid}${part > 1 ? `?p=${part}` : ""}`;
 }
-function proxyImg(url: string) {
-  if (!url) return ''
-  return `/api/image-proxy?url=${encodeURIComponent(url)}`
+function noteState(document?: LearningDocument) {
+  return document?.generationState === "running"
+    ? "生成中"
+    : document?.draft?.text || document?.generationState === "interrupted"
+      ? "未完成"
+      : document?.note
+        ? "有笔记"
+        : "未整理";
 }
-
-/* ─── Animations ─── */
-const fadeUp = {
-  initial: { opacity: 0, y: 30 },
-  animate: { opacity: 1, y: 0 },
-  transition: { duration: 0.8, ease: [0.16, 1, 0.3, 1] },
+function coverage(evidence?: SourceEvidence) {
+  return evidence?.coverage === "full"
+    ? "已分析取得的全部文本"
+    : evidence?.coverage === "partial"
+      ? "仅分析当前片段"
+      : "覆盖范围未确认";
 }
-const stagger = {
-  animate: { transition: { staggerChildren: 0.12 } },
+function cueUrl(video: VideoInfo, cue: SourceCue) {
+  const url = new URL(video.url);
+  if (cue.start !== undefined)
+    url.searchParams.set("t", String(Math.floor(cue.start)));
+  return url.href;
 }
-
-/* ─── Mouse Glow Hook ─── */
-function useMouseGlow(ref: React.RefObject<HTMLElement | null>) {
-  useEffect(() => {
-    const el = ref.current
-    if (!el) return
-    const handler = (e: MouseEvent) => {
-      const rect = el.getBoundingClientRect()
-      el.style.setProperty('--mx', `${e.clientX - rect.left}px`)
-      el.style.setProperty('--my', `${e.clientY - rect.top}px`)
-    }
-    el.addEventListener('mousemove', handler)
-    return () => el.removeEventListener('mousemove', handler)
-  }, [ref])
+async function json(response: Response) {
+  const data = await response.json().catch(() => {
+    throw new Error(`服务暂不可用（${response.status}），请重试。`);
+  });
+  if (!response.ok)
+    throw new Error(
+      data.error || data.message || `请求失败（${response.status}）`,
+    );
+  return data;
 }
 
 export default function Home() {
-  const [url, setUrl] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-  const [video, setVideo] = useState<VideoInfo | null>(null)
-  const [webQuality, setWebQuality] = useState(32)
-  const [downloading, setDownloading] = useState(false)
-  const [downloadResult, setDownloadResult] = useState<{ mode: string; command?: string; message?: string } | null>(null)
-  const [tutorialText, setTutorialText] = useState('')
-  const [tutorialLoading, setTutorialLoading] = useState(false)
-  const [copied, setCopied] = useState('')
-  const [activeTab, setActiveTab] = useState<'download' | 'tutorial'>('download')
-  const [descExpanded, setDescExpanded] = useState(false)
-  const [transcript, setTranscript] = useState('')
-  const [subtitleIndex, setSubtitleIndex] = useState('auto')
-  const [tutorialStatus, setTutorialStatus] = useState('')
-  const [tutorialSource, setTutorialSource] = useState('')
-  const [tutorialError, setTutorialError] = useState('')
-  const [history, setHistory] = useState<{ url: string; title: string }[]>([])
-  const contentRef = useRef<HTMLDivElement>(null)
-  const analyzeAbort = useRef<AbortController | null>(null)
-  const tutorialAbort = useRef<AbortController | null>(null)
-  const downloadAbort = useRef<AbortController | null>(null)
-  const tutorialRef = useRef<HTMLDivElement>(null)
-  const heroRef = useRef<HTMLElement>(null)
-
-  useMouseGlow(heroRef)
+  const {
+    workspace,
+    current,
+    ready,
+    saveStatus,
+    saveError,
+    commit,
+    updateDocument,
+    flush,
+  } = useWorkspace();
+  const document = workspace.activeId
+    ? workspace.documents[workspace.activeId]
+    : undefined;
+  const [home, setHome] = useState(false);
+  const [input, setInput] = useState("");
+  const [opening, setOpening] = useState(false);
+  const [inputError, setInputError] = useState("");
+  const [legacy, setLegacy] = useState<{ url: string; title: string }[]>([]);
+  const [filter, setFilter] = useState("");
+  const [librarySearch, setLibrarySearch] = useState("");
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [directoryOpen, setDirectoryOpen] = useState(false);
+  const [sourceOpen, setSourceOpen] = useState(false);
+  const [downloadOpen, setDownloadOpen] = useState(false);
+  const [clearOpen, setClearOpen] = useState(false);
+  const [selectedCue, setSelectedCue] = useState("");
+  const [sourceSearch, setSourceSearch] = useState("");
+  const [showPrevious, setShowPrevious] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [deleted, setDeleted] = useState<LearningDocument>();
+  const [job, setJob] = useState<{ id: string; status: string } | null>(null);
+  const jobRef = useRef<{ id: string; controller: AbortController } | null>(
+    null,
+  );
+  const analyzeRef = useRef<AbortController>();
+  const contentRef = useRef<HTMLElement>(null);
+  const restoreScroll = useRef(false);
+  const allDocuments = useMemo(
+    () =>
+      Object.values(workspace.documents).sort(
+        (a, b) => b.updatedAt - a.updatedAt,
+      ),
+    [workspace.documents],
+  );
+  const noteDocuments = allDocuments.filter(
+    (item) => item.note || item.draft?.text || item.memo || item.transcript,
+  );
+  const active = document && !home ? document : undefined;
+  const priorNote = active?.draft ? active.note : active?.previousNote;
+  const shownNote = active
+    ? showPrevious && priorNote
+      ? priorNote
+      : active.draft?.text
+        ? active.draft
+        : active.note
+    : undefined;
+  const generationError = active?.draft?.error;
+  const needsSource =
+    !!active &&
+    !active.transcript.trim() &&
+    !active.video.subtitles.length &&
+    (active.video.selectedPage || 1) > 1;
+  const manualCharacters = useMemo(
+    () =>
+      parseTranscript(active?.transcript || "")
+        .map((cue) => cue.text)
+        .join("\n").length,
+    [active?.transcript],
+  );
+  const currentEvidence = active?.draft?.evidence || active?.note?.evidence;
+  const totalCharacters = active?.transcript.trim()
+    ? manualCharacters
+    : currentEvidence?.kind !== "manual"
+      ? currentEvidence?.totalCharacters || 0
+      : 0;
+  const sourceCues = shownNote?.evidence?.cues || [];
+  const matchingCues = sourceCues.filter(
+    (cue) => !sourceSearch || cue.text.includes(sourceSearch),
+  );
+  const focusCue = sourceCues.find((cue) => cue.id === selectedCue);
 
   useEffect(() => {
-    try { const saved = JSON.parse(localStorage.getItem('bili-history') || '[]'); if (Array.isArray(saved)) setHistory(saved.filter(x => typeof x?.url === 'string' && typeof x?.title === 'string').slice(0, 8)) } catch {}
-    return () => { analyzeAbort.current?.abort(); tutorialAbort.current?.abort(); downloadAbort.current?.abort() }
-  }, [])
-  useEffect(() => { if (video || error) contentRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }, [video, error])
-
-  const copy = useCallback(async (text: string, label: string) => {
-    try { await navigator.clipboard.writeText(text); setCopied(label); setTimeout(() => setCopied(''), 2000) }
-    catch { setError('复制失败，请选中内容手动复制。') }
-  }, [])
-
-  async function responseJson(r: Response) {
-    let data
-    try { data = await r.json() } catch { throw new Error(`服务暂不可用（${r.status}），请稍后重试。`) }
-    if (!r.ok) throw new Error(data.error || `请求失败（${r.status}）`)
-    return data
-  }
-
-  async function analyze(input?: string) {
-    const value = input || url
-    if (!value.trim()) return
-    analyzeAbort.current?.abort(); tutorialAbort.current?.abort(); downloadAbort.current?.abort()
-    const controller = new AbortController(); analyzeAbort.current = controller
-    setUrl(value); setLoading(true); setError(''); setVideo(null); setTutorialLoading(false); setDownloading(false)
-    setTutorialText(''); setTutorialError(''); setTutorialSource(''); setTranscript(''); setSubtitleIndex('auto'); setActiveTab('download'); setDownloadResult(null); setDescExpanded(false)
-    const timeout = setTimeout(() => controller.abort(), 55000)
     try {
-      const link = parseVideoLink(value)
-      let d
-      if (link.platform === 'bilibili' && !link.short) {
-        try { d = await browserVideoInfo(link.url, controller.signal) } catch (e) { if (controller.signal.aborted) throw e }
+      setLegacy(migrateHistory(localStorage.getItem("bili-history")));
+    } catch {}
+  }, []);
+  useEffect(() => {
+    if (!ready || !document || home) return;
+    restoreScroll.current = true;
+    const timeout = setTimeout(() => {
+      window.scrollTo({
+        top: document.scrollY || 0,
+        behavior: "instant" as ScrollBehavior,
+      });
+      restoreScroll.current = false;
+    }, 50);
+    setShowPrevious(false);
+    setSelectedCue("");
+    setFilter("");
+    return () => clearTimeout(timeout);
+    // Only restore when switching documents, never on streamed updates.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace.activeId, home, ready]);
+  useEffect(() => {
+    let timeout: ReturnType<typeof setTimeout>;
+    const remember = () => {
+      clearTimeout(timeout);
+      timeout = setTimeout(() => {
+        const id = current.current.activeId;
+        if (!id || restoreScroll.current || home) return;
+        updateDocument(id, (value) => ({ ...value, scrollY: window.scrollY }));
+      }, 350);
+    };
+    window.addEventListener("scroll", remember, { passive: true });
+    return () => {
+      clearTimeout(timeout);
+      window.removeEventListener("scroll", remember);
+    };
+  }, [current, home, updateDocument]);
+  useEffect(
+    () => () => {
+      analyzeRef.current?.abort();
+      jobRef.current?.controller.abort();
+    },
+    [],
+  );
+
+  const openSaved = useCallback(
+    (id: string) => {
+      analyzeRef.current?.abort();
+      analyzeRef.current = undefined;
+      setOpening(false);
+      commit((value) => ({ ...value, activeId: id }));
+      setHome(false);
+      setInputError("");
+      setLibraryOpen(false);
+      setDirectoryOpen(false);
+      setSourceOpen(false);
+      setDownloadOpen(false);
+    },
+    [commit],
+  );
+
+  async function openVideo(value: string, refresh = false) {
+    if (!value.trim() || !ready) return;
+    analyzeRef.current?.abort();
+    const controller = new AbortController();
+    analyzeRef.current = controller;
+    setOpening(true);
+    setInputError("");
+    const timeout = setTimeout(() => controller.abort(), 55000);
+    try {
+      const link = parseVideoLink(value);
+      const id = documentId(link.url);
+      if (!refresh && current.current.documents[id]) {
+        openSaved(id);
+        setInput("");
+        return;
       }
-      if (!d) {
-        const r = await fetch('/api/video-info', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-          body: JSON.stringify({ url: value.trim() }),
-        })
-        d = await r.json().catch(() => { throw new Error(`服务暂不可用（${r.status}），请稍后重试。`) })
-        if (!r.ok) {
-          if (d.browserFallback) d = await browserVideoInfo(d.resolvedUrl || value, controller.signal)
-          else throw new Error(d.error || `解析失败（${r.status}）`)
+      let video: VideoInfo | undefined;
+      if (link.platform === "bilibili" && !link.short) {
+        try {
+          video = await browserVideoInfo(link.url, controller.signal);
+        } catch {
+          if (controller.signal.aborted) return;
         }
       }
-      if (controller.signal.aborted) return
-      setVideo(d); setUrl(d.url)
-      const next = [{ url: d.url, title: d.title }, ...history.filter(x => x.url !== d.url)].slice(0, 8)
-      setHistory(next)
-      try { localStorage.setItem('bili-history', JSON.stringify(next)) } catch {}
-    } catch (e: unknown) {
-      if (analyzeAbort.current === controller) setError(controller.signal.aborted ? '解析超时，请稍后重试。' : e instanceof Error ? e.message : '解析失败')
-    } finally { clearTimeout(timeout); if (analyzeAbort.current === controller) { setLoading(false); analyzeAbort.current = null } }
+      if (!video) {
+        const response = await fetch("/api/video-info", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({ url: value }),
+        });
+        const data = await response.json().catch(() => {
+          throw new Error("视频服务暂不可用，请重试。");
+        });
+        if (!response.ok) {
+          if (data.browserFallback)
+            video = await browserVideoInfo(
+              data.resolvedUrl || value,
+              controller.signal,
+            );
+          else throw new Error(data.error || "视频无法打开");
+        } else video = data;
+      }
+      if (controller.signal.aborted || !video) return;
+      const metadata = video,
+        nextId = documentId(metadata.url);
+      commit((state) => {
+        const existing = state.documents[nextId];
+        return {
+          ...state,
+          activeId: nextId,
+          documents: {
+            ...state.documents,
+            [nextId]: existing
+              ? { ...existing, video: metadata }
+              : createDocument(metadata),
+          },
+        };
+      });
+      setInput("");
+      setHome(false);
+      setDirectoryOpen(false);
+      setLibraryOpen(false);
+      setSourceOpen(false);
+      setDownloadOpen(false);
+    } catch (error) {
+      if (analyzeRef.current === controller)
+        setInputError(
+          controller.signal.aborted
+            ? "打开视频超时，请重试。"
+            : error instanceof Error
+              ? error.message
+              : "视频无法打开，请重试。",
+        );
+    } finally {
+      clearTimeout(timeout);
+      if (analyzeRef.current === controller) {
+        setOpening(false);
+        analyzeRef.current = undefined;
+      }
+    }
   }
 
-  async function downloadVideo() {
-    if (!video || downloading) return
-    const controller = new AbortController(); downloadAbort.current = controller
-    setDownloading(true); setDownloadResult(null); setActiveTab('download')
-    const timeout = setTimeout(() => controller.abort(), 65000)
+  async function generate() {
+    if (!active || jobRef.current || needsSource) return;
+    if (active.transcript.trim() && active.transcript.trim().length < 30) {
+      setSourceOpen(true);
+      setNotice("请粘贴至少 30 个字符的实际视频内容。");
+      return;
+    }
+    const snapshot = active,
+      id = active.id,
+      controller = new AbortController();
+    jobRef.current = { id, controller };
+    setJob({ id, status: "正在读取本节内容…" });
+    setShowPrevious(false);
+    let output = "",
+      source = "",
+      evidence: SourceEvidence | undefined,
+      warning = "",
+      completed = false;
+    const generatedAt = Date.now();
+    updateDocument(id, (value) => ({
+      ...value,
+      generationState: "running",
+      updatedAt: generatedAt,
+      note: value.note || (value.draft?.text ? value.draft : undefined),
+      draft: { text: "", source: "", status: "partial", generatedAt },
+    }));
+    contentRef.current?.focus({ preventScroll: true });
+    const timeout = setTimeout(() => controller.abort(), 65000);
+    const storeDraft = (error?: string) =>
+      updateDocument(id, (value) => ({
+        ...value,
+        draft: {
+          text: output,
+          source,
+          evidence,
+          status: "partial",
+          error,
+          generatedAt,
+        },
+      }));
     try {
-      const r = await fetch('/api/download', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-        body: JSON.stringify({ url: video.url, bvid: video.bvid, cid: video.cid, quality: webQuality }),
-      })
-      if (r.ok && (r.headers.get('content-type') || '').includes('video/')) {
-        const blob = await r.blob()
-        const expected = Number(r.headers.get('X-Video-Size'))
-        if (!blob.size || (expected > 0 && blob.size !== expected)) throw new Error('下载在传输途中中断，请降低网页画质重试，或使用本机下载。')
-        const a = document.createElement('a'), objectUrl = URL.createObjectURL(blob)
-        a.href = objectUrl; a.download = `${video.title.replace(/[\\/:*?"<>|]/g, '_')}.mp4`
-        document.body.appendChild(a); a.click(); a.remove()
-        setTimeout(() => URL.revokeObjectURL(objectUrl), 60000)
-        setDownloadResult({ mode: 'success', message: `视频已准备好，请在浏览器下载列表中确认保存。实际画质：${({16: '360p', 32: '480p', 64: '720p'} as Record<number, string>)[Number(r.headers.get('X-Video-Quality'))] || '平台可用画质'}。` })
-      } else setDownloadResult(await responseJson(r))
-    } catch (e: unknown) {
-      if (downloadAbort.current === controller) setDownloadResult({ mode: 'fallback', command: downloadCommand(video.url), message: controller.signal.aborted ? '网页下载超时，请使用下方本机下载指令。' : e instanceof Error ? e.message : '下载失败，请使用本机下载。' })
-    } finally { clearTimeout(timeout); if (downloadAbort.current === controller) { setDownloading(false); downloadAbort.current = null } }
+      const subtitle =
+        snapshot.subtitleIndex === "auto"
+          ? snapshot.video.subtitles[0]
+          : snapshot.video.subtitles[Number(snapshot.subtitleIndex)];
+      const response = await fetch("/api/tutorial", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          videoUrl: snapshot.video.url,
+          title: `${snapshot.video.title} · P${snapshot.video.selectedPage || 1} ${partName(snapshot.video)}`,
+          transcript: snapshot.transcript,
+          transcriptOffset: snapshot.transcriptOffset,
+          subtitleUrl: subtitle?.subtitle_url || "",
+          sourceMode: snapshot.subtitleIndex === "auto" ? "auto" : "subtitle",
+        }),
+      });
+      if (!response.ok) {
+        await json(response);
+        return;
+      }
+      if (
+        !response.body ||
+        !response.headers.get("content-type")?.includes("text/event-stream")
+      )
+        throw new Error("生成服务返回格式异常，请重试。");
+      await readSSE(response.body, (payload) => {
+        if (controller.signal.aborted) return;
+        if (payload === "[DONE]") {
+          completed = true;
+          return;
+        }
+        let event;
+        try {
+          event = JSON.parse(payload);
+        } catch {
+          return;
+        }
+        if (event.error) throw new Error(event.error);
+        if (event.status) setJob({ id, status: event.status });
+        if (event.source) source = event.source;
+        if (event.evidence) evidence = event.evidence;
+        if (event.warning) warning = event.warning;
+        if (event.text) output += event.text;
+        storeDraft(warning || undefined);
+      });
+      if (!completed || !output.trim())
+        throw new Error("生成中断或没有内容，请重试。");
+      const result: LearningNote = {
+        text: output,
+        source,
+        evidence,
+        status: warning ? "partial" : "complete",
+        error: warning || undefined,
+        generatedAt,
+      };
+      updateDocument(id, (value) => ({
+        ...value,
+        note: result,
+        previousNote: value.note || value.previousNote,
+        draft: undefined,
+        generationState: "idle",
+        updatedAt: Date.now(),
+      }));
+    } catch (error) {
+      const message = controller.signal.aborted
+        ? "生成已停止或超时，已收到的内容保留。"
+        : error instanceof Error
+          ? error.message
+          : "生成失败，请重试。";
+      storeDraft(message);
+      updateDocument(id, (value) => ({
+        ...value,
+        generationState: "interrupted",
+      }));
+    } finally {
+      clearTimeout(timeout);
+      if (jobRef.current?.controller === controller) {
+        jobRef.current = null;
+        setJob(null);
+      }
+      flush();
+    }
   }
 
-  async function generateTutorial() {
-    if (!video || tutorialLoading) return
-    const controller = new AbortController(); tutorialAbort.current = controller
-    setTutorialLoading(true); setTutorialText(''); setTutorialError(''); setTutorialSource(''); setTutorialStatus('正在连接 AI 服务…'); setActiveTab('tutorial')
-    const subtitleUrl = subtitleIndex === 'auto' ? video.subtitles?.[0]?.subtitle_url || '' : video.subtitles?.[Number(subtitleIndex)]?.subtitle_url || ''
-    let output = '', completed = false
-    const timeout = setTimeout(() => controller.abort(), 65000)
+  function exportNote(item = active, note = shownNote) {
+    if (!item) return;
+    const title = partName(item.video);
+    const cues = note?.evidence?.cues || [];
+    const markdown = tutorialMarkdown(note?.text || "").replace(
+      /\[([^\]]+)\]\(source:(\d+)\)/g,
+      (match, label, id) =>
+        cues.some((cue) => cue.id === id) ? `[${label}][^source-${id}]` : label,
+    );
+    const references = cues.length
+      ? "\n\n## 来源原文\n\n" +
+        cues
+          .map(
+            (cue) =>
+              `[^source-${cue.id}]: ${cue.text.replace(/\n/g, "\n    ")}${cue.start !== undefined ? ` [回看 ${duration(cue.start)}](${cueUrl(item.video, cue)})` : ""}`,
+          )
+          .join("\n\n")
+      : "";
+    const text = `# ${title}\n\n来源：${item.video.url}\n\n依据：${note?.source || "未生成"}\n覆盖：${coverage(note?.evidence)}\n${note?.evidence?.limitation ? `说明：${note.evidence.limitation}\n` : ""}${note?.status === "partial" || note?.error ? `\n注意：内容未完成。${note.error || ""}\n` : ""}\n${markdown}${references}\n\n## 我的备注\n\n${item.memo || "暂无备注"}\n${item.transcript ? `\n## 待整理的输入文本\n\n${item.transcript}\n` : ""}`;
+    const href = URL.createObjectURL(
+        new Blob([text], { type: "text/markdown;charset=utf-8" }),
+      ),
+      link = window.document.createElement("a");
+    link.href = href;
+    link.download = `${title.replace(/[\\/:*?"<>|]/g, "_")}-学习笔记.md`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(href), 10000);
+  }
+  async function copyNote() {
     try {
-      const r = await fetch('/api/tutorial', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-        body: JSON.stringify({ subtitleUrl, title: `${video.title}${(video.pages?.length || 0) > 1 ? ` · P${video.selectedPage} ${video.pages?.find(p => p.page === video.selectedPage)?.title || ''}` : ''}`, videoUrl: video.url, transcript, sourceMode: subtitleIndex === 'auto' ? 'auto' : 'subtitle' }),
-      })
-      if (!r.ok) { await responseJson(r); return }
-      if (!r.body || !r.headers.get('content-type')?.includes('text/event-stream')) throw new Error('AI 服务返回格式异常，请重试。')
-      await readSSE(r.body, payload => {
-        if (controller.signal.aborted) return
-        if (payload === '[DONE]') { completed = true; return }
-        let event
-        try { event = JSON.parse(payload) } catch { return }
-        if (event.error) throw new Error(event.error)
-        if (event.status) setTutorialStatus(event.status)
-        if (event.source) setTutorialSource(event.source)
-        if (event.warning) setTutorialError(event.warning)
-        if (event.text) { output += event.text; setTutorialText(output) }
-      })
-      if (!completed || !output.trim()) throw new Error('生成中断或没有返回内容，请重试。')
-      setTutorialStatus('生成完成')
-    } catch (e: unknown) {
-      if (tutorialAbort.current === controller) setTutorialError(controller.signal.aborted ? '生成已停止，已收到的内容保留在下方。' : e instanceof Error ? e.message : '教程生成失败')
-    } finally { clearTimeout(timeout); if (tutorialAbort.current === controller) { setTutorialLoading(false); tutorialAbort.current = null } }
+      await navigator.clipboard.writeText(
+        tutorialMarkdown(shownNote?.text || ""),
+      );
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setNotice("复制失败，请选中正文手动复制，或导出笔记。");
+    }
   }
-
-  function exportTutorial() {
-    if (!video || !tutorialText) return
-    const blob = new Blob([`# ${video.title}\n\n来源：${video.url}\n\n依据：${tutorialSource || '视频内容'}\n${tutorialError ? `\n注意：${tutorialError}\n` : ''}\n${tutorialMarkdown(tutorialText)}`], { type: 'text/markdown;charset=utf-8' })
-    const href = URL.createObjectURL(blob), a = document.createElement('a')
-    a.href = href; a.download = `${video.title.replace(/[\\/:*?"<>|]/g, '_')}-学习笔记.md`
-    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(href), 60000)
+  function removeDocument(item: LearningDocument) {
+    if (jobRef.current?.id === item.id) {
+      setNotice("请先停止这一节的生成，再删除笔记。");
+      return;
+    }
+    setDeleted(item);
+    commit((state) => {
+      const documents = { ...state.documents };
+      delete documents[item.id];
+      return {
+        ...state,
+        documents,
+        activeId:
+          state.activeId === item.id
+            ? Object.keys(documents)[0] || null
+            : state.activeId,
+      };
+    });
   }
+  function openCitation(id: string) {
+    if (!sourceCues.some((cue) => cue.id === id)) return;
+    setSelectedCue(id);
+    setSourceOpen(true);
+  }
+  const directory =
+    active?.video.pages?.filter(
+      (part) =>
+        !filter ||
+        `${part.page} ${part.title}`
+          .toLowerCase()
+          .includes(filter.toLowerCase()),
+    ) || [];
+  const nextPart = active?.video.pages?.find(
+    (part) => part.page === (active.video.selectedPage || 1) + 1,
+  );
+  const navigation = active && (
+    <>
+      <div className="course-caption">
+        {active.video.thumbnail && (
+          <img
+            src={`/api/image-proxy?url=${encodeURIComponent(active.video.thumbnail)}`}
+            alt=""
+          />
+        )}
+        <span>
+          {active.video.platform === "bilibili" ? "B 站" : "YouTube"}
+          <br />
+          <strong>{active.video.uploader}</strong>
+        </span>
+      </div>
+      <h2 className="course-title">{active.video.title}</h2>
+      <div className="course-count">
+        {active.video.pages?.length || 1} 节内容 · 每次整理一节
+      </div>
+      {(active.video.pages?.length || 0) > 1 ? (
+        <>
+          <label className="search-field">
+            <Search size={15} />
+            <input
+              aria-label="查找课程章节"
+              value={filter}
+              onChange={(event) => setFilter(event.target.value)}
+              placeholder="查找这一节"
+            />
+          </label>
+          <nav className="course-list" aria-label="课程章节">
+            {directory.map((part) => {
+              const stored =
+                workspace.documents[
+                  documentId(partUrl(active.video, part.page))
+                ];
+              return (
+                <button
+                  key={part.cid}
+                  className={`course-item ${part.page === (active.video.selectedPage || 1) ? "selected" : ""}`}
+                  aria-current={
+                    part.page === (active.video.selectedPage || 1)
+                      ? "page"
+                      : undefined
+                  }
+                  onClick={() => openVideo(partUrl(active.video, part.page))}
+                >
+                  <span className="part-number">
+                    {String(part.page).padStart(2, "0")}
+                  </span>
+                  <span>
+                    <strong>{part.title}</strong>
+                    <small>
+                      {duration(part.duration)} · {noteState(stored)}
+                    </small>
+                  </span>
+                </button>
+              );
+            })}
+            {!directory.length && (
+              <p className="muted small">没有匹配的章节。</p>
+            )}
+          </nav>
+        </>
+      ) : (
+        <p className="muted small">当前是一节独立视频。</p>
+      )}
+      <button
+        className="sidebar-library text-button"
+        onClick={() => setLibraryOpen(true)}
+      >
+        <Library size={16} />
+        我的笔记 <span>{noteDocuments.length}</span>
+      </button>
+    </>
+  );
 
   return (
-    <main className="relative z-10 min-h-screen">
-
-      {/* ═══════════ HERO — Full viewport, extreme typography ═══════════ */}
-      <section
-        ref={heroRef}
-        className="hero-section relative min-h-[65vh] py-14 sm:py-20 flex flex-col items-center justify-center px-4 sm:px-6 overflow-hidden"
-      >
-        {/* Mouse-following glow */}
-        <div className="mouse-glow" />
-
-        {/* Floating accent orbs */}
-        <div className="absolute top-[15%] left-[20%] w-[400px] h-[400px] rounded-full bg-[var(--accent-deep)] opacity-[0.03] blur-[150px] float-slow pointer-events-none" />
-        <div className="absolute bottom-[20%] right-[15%] w-[300px] h-[300px] rounded-full bg-[var(--gold)] opacity-[0.02] blur-[120px] float-slow pointer-events-none" style={{ animationDelay: '-4s' }} />
-
-        <motion.div {...stagger} initial="initial" animate="animate" className="text-center w-full max-w-4xl mx-auto">
-
-          {/* Micro badge */}
-          <motion.div {...fadeUp} className="inline-flex items-center gap-2.5 px-5 py-2 rounded-full glass text-[11px] tracking-[0.15em] uppercase text-[var(--text-dim)] mb-10 font-medium">
-            <span className="relative flex h-1.5 w-1.5">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--success)] opacity-75" />
-              <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-[var(--success)]" />
-            </span>
-            视频解析 · 字幕学习 · 本机下载
-          </motion.div>
-
-          {/* ─── EXTREME Title ─── */}
-          <motion.h1
-            {...fadeUp}
-            transition={{ ...fadeUp.transition, delay: 0.1 }}
-            className="font-display font-bold tracking-[-0.04em] mb-6 leading-[0.9]"
-            style={{ fontSize: 'clamp(3.5rem, 10vw, 8rem)' }}
+    <main className={active ? "application working" : "application"}>
+      <header className="topbar">
+        <button
+          className="brand"
+          onClick={() => {
+            setHome(true);
+            window.scrollTo({ top: 0 });
+          }}
+          aria-label="BiliHelper 首页"
+        >
+          <span className="brand-mark">
+            <BookOpen size={20} />
+          </span>
+          <span>
+            Bili<span className="accent">Helper</span>
+            <small>视频学习笔记</small>
+          </span>
+        </button>
+        <div className="topbar-actions">
+          <span className={`save-indicator ${saveStatus}`} role="status">
+            {saveStatus === "saved" ? (
+              <Check size={14} />
+            ) : saveStatus === "saving" ? (
+              <Loader2 size={14} className="spin" />
+            ) : (
+              <ShieldCheck size={14} />
+            )}
+            {saveStatus === "saved"
+              ? "已保存在这台设备"
+              : saveStatus === "saving"
+                ? "保存中…"
+                : "未能保存"}
+          </span>
+          <button
+            className="secondary library-button"
+            aria-label="我的笔记"
+            onClick={() => setLibraryOpen(true)}
           >
-            <span className="bg-clip-text text-transparent bg-gradient-to-b from-white via-[#e8e8ed] to-[var(--text-dim)]">
-              Bili
-            </span>
-            <span className="bg-clip-text text-transparent bg-gradient-to-b from-[var(--accent-bright)] via-[var(--accent)] to-[var(--accent-deep)]">
-              Helper
-            </span>
-          </motion.h1>
-
-          {/* Subtitle — restrained, high contrast with title */}
-          <motion.p
-            {...fadeUp}
-            transition={{ ...fadeUp.transition, delay: 0.2 }}
-            className="text-base sm:text-lg text-[var(--text-dim)] max-w-md mx-auto mb-14 leading-relaxed font-light tracking-wide"
-          >
-            粘贴链接，<span className="text-[var(--text-secondary)]">解码一切</span>。
-            <br />
-            <span className="text-[0.8rem]">AI 学习笔记 · 视频下载 · 字幕来源</span>
-          </motion.p>
-
-          {/* ─── Search Bar — Elevated glass terminal ─── */}
-          <motion.div
-            {...fadeUp}
-            transition={{ ...fadeUp.transition, delay: 0.3 }}
-            className="w-full max-w-2xl mx-auto"
-          >
-            <div className="search-container glass-elevated rounded-2xl p-2">
-              <div className="flex gap-2">
-                <div className="relative flex-1 min-w-0">
-                  <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-[var(--text-dim)]" />
-                  <input
-                    type="text" aria-label="视频链接" autoComplete="off" spellCheck={false} value={url} onChange={e => setUrl(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && !e.nativeEvent.isComposing && !loading && analyze()}
-                    placeholder="视频链接、分享文本或 BV 号"
-                    className="w-full bg-transparent pl-12 pr-4 py-4 sm:py-5 text-[var(--text-primary)] placeholder-[var(--text-dim)] outline-none text-base font-light tracking-wide"
-                  />
-                </div>
-                <button
-                  onClick={() => analyze()} disabled={loading || !url.trim()}
-                  className="btn-primary disabled:opacity-30 disabled:cursor-not-allowed disabled:transform-none px-4 sm:px-10 py-4 sm:py-5 text-sm font-semibold whitespace-nowrap rounded-xl tracking-wide uppercase"
-                >
-                  {loading ? (
-                    <span className="flex items-center gap-2">
-                      <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
-                      解析中
-                    </span>
-                  ) : '解析'}
+            <Library size={16} />
+            <span>我的笔记</span>
+          </button>
+        </div>
+      </header>
+      {!ready && (
+        <p className="loading-workspace">
+          <Loader2 className="spin" size={18} />
+          正在打开你的工作台…
+        </p>
+      )}
+      {ready && (
+        <>
+          {saveStatus === "failed" && (
+            <div className="storage-warning" role="alert">
+              {saveError || "本机保存失败，请导出重要笔记。"}
+              <button className="text-button" onClick={flush}>
+                重试保存
+              </button>
+              {active && (
+                <button className="text-button" onClick={() => exportNote()}>
+                  导出当前笔记
                 </button>
-              </div>
+              )}
             </div>
-
-            <p className="mt-3 text-xs text-[var(--text-secondary)]">支持 B 站视频 / 分 P / 短链接，以及 YouTube 视频与 Shorts</p>
-            {history.length > 0 && <div className="mt-4 text-left glass rounded-xl p-3">
-              <div className="flex justify-between text-xs text-[var(--text-secondary)] mb-2"><span>最近解析 · 仅保存在这台设备</span><button onClick={() => { setHistory([]); try { localStorage.removeItem('bili-history') } catch {} }} className="hover:text-white">清空记录</button></div>
-              <div className="flex flex-wrap gap-2">{history.slice(0, 4).map(item => <button key={item.url} disabled={loading} onClick={() => analyze(item.url)} title={item.title} className="max-w-full truncate rounded-lg bg-white/5 px-3 py-2 text-xs text-[var(--text-secondary)] hover:text-white">{item.title}</button>)}</div>
-            </div>}
-
-            {/* Feature pills — asymmetric */}
-            <motion.div
-              {...fadeUp}
-              transition={{ ...fadeUp.transition, delay: 0.5 }}
-              className="flex items-center justify-center gap-3 sm:gap-8 mt-5 text-[11px] tracking-[0.12em] uppercase text-[var(--text-dim)] font-medium"
-            >
-              <span className="flex items-center gap-2"><Zap className="w-3 h-3 text-[var(--accent)]" />链接解析</span>
-              <span className="w-[1px] h-3 bg-[var(--border)]" />
-              <span className="flex items-center gap-2"><Download className="w-3 h-3 text-[var(--accent)]" />本机下载</span>
-              <span className="w-[1px] h-3 bg-[var(--border)]" />
-              <span className="flex items-center gap-2"><Sparkles className="w-3 h-3 text-[var(--gold)]" />AI 教程</span>
-            </motion.div>
-          </motion.div>
-        </motion.div>
-      </section>
-
-      {/* ═══════════ CONTENT AREA ═══════════ */}
-      <div ref={contentRef} className="max-w-4xl mx-auto px-4 sm:px-6 pb-16 scroll-mt-6">
-
-        {/* Error */}
-        <AnimatePresence>
-          {error && (
-            <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
-              role="alert" className="flex items-center gap-3 glass rounded-xl p-4 mb-6 border-[var(--danger)]/20 border">
-              <AlertCircle className="w-5 h-5 text-[var(--danger)] shrink-0" />
-              <span className="text-[var(--danger)] text-sm">{error}</span>
-              <button aria-label="关闭错误提示" onClick={() => setError('')} className="ml-auto text-[var(--text-dim)] hover:text-white text-xs">✕</button>
-            </motion.div>
           )}
-        </AnimatePresence>
-
-        {/* ═══════════ VIDEO CARD — Asymmetric Bento ═══════════ */}
-        <AnimatePresence>
-          {video && (
-            <motion.div
-              initial={{ opacity: 0, y: 40, scale: 0.97 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              transition={{ duration: 0.7, ease: [0.16, 1, 0.3, 1] }}
-              className="space-y-4"
-            >
-              {/* Video Info — Cinematic card */}
-              <div className="glass-elevated rounded-2xl overflow-hidden">
-                {video.thumbnail && (
-                  <div className="relative h-48 sm:h-72 overflow-hidden">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={proxyImg(video.thumbnail)}
-                      alt={video.title}
-                      className="w-full h-full object-cover"
+          {job && job.id !== active?.id && (
+            <div className="background-job" role="status">
+              <Loader2 size={15} className="spin" />
+              正在整理 P{workspace.documents[job.id]?.video.selectedPage ||
+                1} · {job.status}
+              <button className="text-button" onClick={() => openSaved(job.id)}>
+                查看进度
+              </button>
+              <button
+                className="text-button"
+                onClick={() => jobRef.current?.controller.abort()}
+              >
+                停止
+              </button>
+            </div>
+          )}
+          {!active ? (
+            <section className="landing">
+              <div className="landing-copy">
+                <div className="eyebrow">
+                  <span />
+                  从视频，到自己的理解
+                </div>
+                <h1>
+                  这一节，
+                  <br />
+                  留给下次的自己。
+                </h1>
+                <p className="landing-description">
+                  把教程整理成有依据的学习笔记。
+                  <br />
+                  找到重点，留下理解，下次回来继续。
+                </p>
+                <form
+                  className="import-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    openVideo(input);
+                  }}
+                >
+                  <label className="link-input">
+                    <Link2 size={20} />
+                    <input
+                      aria-label="视频链接"
+                      value={input}
+                      onChange={(event) => setInput(event.target.value)}
+                      placeholder="粘贴链接、分享文本或 BV 号"
                     />
-                    <div className="absolute inset-0 bg-gradient-to-t from-[var(--bg-deep)] via-[var(--bg-deep)]/50 to-transparent" />
-
-                    {/* Overlay pills */}
-                    <div className="absolute bottom-4 left-4 right-4 flex items-end justify-between">
-                      <span className="text-[10px] font-semibold uppercase tracking-[0.2em] bg-[var(--accent-deep)]/90 backdrop-blur-sm px-3 py-1.5 rounded-lg text-white/90">
-                        {video.platform === 'bilibili' ? 'Bilibili' : 'YouTube'}
-                      </span>
-                      {video.duration && (
-                        <div className="flex items-center gap-1.5 bg-black/60 backdrop-blur-sm px-3 py-1.5 rounded-lg text-sm text-white/80 font-mono">
-                          <Clock className="w-3.5 h-3.5" />
-                          {fmtDur(video.duration)}
-                        </div>
-                      )}
-                    </div>
-                  </div>
+                  </label>
+                  <button
+                    className="primary"
+                    disabled={opening || !input.trim()}
+                  >
+                    {opening ? (
+                      <Loader2 size={17} className="spin" />
+                    ) : (
+                      <ArrowRight size={17} />
+                    )}
+                    打开视频
+                  </button>
+                </form>
+                {inputError && (
+                  <p className="input-error" role="alert">
+                    {inputError}
+                  </p>
                 )}
-
-                <div className="p-6 sm:p-8">
-                  <h2 className="font-display text-xl sm:text-2xl font-bold leading-snug mb-4 tracking-tight">{video.title}</h2>
-
-                  <div className="flex items-center gap-3 mb-5">
-                    {video.avatar && (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img src={proxyImg(video.avatar)} alt="" className="w-9 h-9 rounded-full ring-2 ring-[var(--border)]" />
-                    )}
-                    <span className="text-sm font-medium text-[var(--text-secondary)]">{video.uploader}</span>
-                    {video.url && (
-                      <a aria-label="打开原视频" href={video.url} target="_blank" rel="noopener noreferrer"
-                        className="ml-auto text-[var(--text-dim)] hover:text-[var(--accent)] transition-colors">
-                        <ExternalLink className="w-4 h-4" />
-                      </a>
-                    )}
+                <p className="small muted support-line">
+                  支持 B 站视频、分 P、短链接与 YouTube
+                </p>
+                <button
+                  className="text-button example-link"
+                  onClick={() => openVideo(EXAMPLE)}
+                >
+                  试着打开一节 Python 课程 <ArrowRight size={14} />
+                </button>
+                {document && (
+                  <button
+                    className="continue-card"
+                    onClick={() => openSaved(document.id)}
+                  >
+                    <span className="eyebrow">继续上次</span>
+                    <strong>{partName(document.video)}</strong>
+                    <span className="small muted">
+                      P{document.video.selectedPage || 1} ·{" "}
+                      {noteState(document)}
+                      <ArrowRight size={15} />
+                    </span>
+                  </button>
+                )}
+              </div>
+              <div className="note-preview" aria-label="笔记结构预览">
+                <div className="preview-top">
+                  <span className="preview-dots">● ● ●</span>
+                  <span>笔记结构预览</span>
+                </div>
+                <div className="preview-page">
+                  <div className="preview-label">
+                    <FileText size={14} />
+                    每一节，都有自己的笔记
                   </div>
-
-                  {(video.pages?.length || 0) > 1 && <p className="text-sm text-[var(--accent)] mb-4">当前分 P：P{video.selectedPage} · {video.pages?.find(p => p.page === video.selectedPage)?.title}</p>}
-                  {/* Stats row */}
-                  {video.views !== undefined && (
-                    <div className="flex flex-wrap gap-2 mb-4">
-                      <span className="stat-pill"><Eye className="w-3.5 h-3.5" />{fmt(video.views)}</span>
-                      {video.likes !== undefined && <span className="stat-pill"><ThumbsUp className="w-3.5 h-3.5" />{fmt(video.likes)}</span>}
-                      {video.danmakus !== undefined && <span className="stat-pill"><MessageCircle className="w-3.5 h-3.5" />{fmt(video.danmakus)}</span>}
+                  <h2>
+                    从看过，
+                    <br />
+                    到下次用得上。
+                  </h2>
+                  <div className="preview-source">
+                    <ShieldCheck size={14} />
+                    当前这一节 · 来源 · 覆盖范围
+                  </div>
+                  <div className="preview-section">
+                    <span>01</span>
+                    <div>
+                      <h3>本节要解决什么</h3>
+                      <p>先看清这节内容的目的。</p>
                     </div>
-                  )}
-
-                  {/* Description — Expandable */}
-                  {video.description && (
-                    <div className="mt-4">
-                      <p className={`text-sm text-[var(--text-dim)] leading-relaxed whitespace-pre-wrap ${!descExpanded ? 'line-clamp-3' : ''}`}>
-                        {video.description}
-                      </p>
-                      {video.description.length > 100 && (
-                        <button
-                          onClick={() => setDescExpanded(!descExpanded)}
-                          className="flex items-center gap-1 mt-2 text-xs text-[var(--accent)] hover:text-[var(--accent-bright)] transition-colors font-medium"
-                        >
-                          {descExpanded ? <><ChevronUp className="w-3 h-3" />收起</> : <><ChevronDown className="w-3 h-3" />展开全部</>}
-                        </button>
-                      )}
+                  </div>
+                  <div className="preview-section">
+                    <span>02</span>
+                    <div>
+                      <h3>关键知识与跟做步骤</h3>
+                      <p>有原文支持，才能放心回看。</p>
                     </div>
-                  )}
+                  </div>
+                  <div className="preview-memo">
+                    <span>我的备注</span>
+                    <p>把自己的理解也留下来。</p>
+                    <div className="preview-line" />
+                  </div>
+                  <div className="preview-saved">
+                    <Check size={13} />
+                    笔记和备注，留在这台设备
+                  </div>
                 </div>
               </div>
-
-              {(video.pages?.length || 0) > 1 && <div className="glass rounded-xl p-4">
-                <label htmlFor="part" className="text-sm mr-3">选择分 P</label>
-                <select id="part" value={video.selectedPage || 1} onChange={e => analyze(`https://www.bilibili.com/video/${video.bvid}?p=${e.target.value}`)} className="max-w-full bg-[var(--bg-deep)] p-2 rounded-lg text-sm">{video.pages?.map(p => <option key={p.cid} value={p.page}>P{p.page} · {p.title} ({fmtDur(p.duration)})</option>)}</select>
-              </div>}
-
-              <div className="glass rounded-xl p-4 text-sm">
-                <label htmlFor="quality" className="mr-3">网页下载画质</label>
-                <select id="quality" value={webQuality} disabled={downloading} onChange={e => setWebQuality(Number(e.target.value))} className="bg-[var(--bg-deep)] p-2 rounded-lg">
-                  <option value={32}>优先 480p</option><option value={16}>360p · 文件更小</option><option value={64}>优先 720p</option>
-                </select>
-                <p className="mt-2 text-xs text-[var(--text-secondary)]">以平台公开提供的实际画质为准。网页下载最多 40 MiB，更大文件或最高画质请使用本机下载。</p>
+              <div className="landing-bottom">
+                <span>
+                  <ShieldCheck size={17} />
+                  根据实际内容整理
+                </span>
+                <span>
+                  <BookOpen size={17} />
+                  一节一份，可回来继续
+                </span>
+                <span>
+                  <ArrowDownToLine size={17} />
+                  随时导出 Markdown
+                </span>
               </div>
-              {/* ─── Action Bento Grid — Asymmetric 2-col ─── */}
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  onClick={downloadVideo} disabled={downloading}
-                  className="glass glow-border rounded-2xl p-5 sm:p-6 text-left group transition-all disabled:opacity-30 hover:bg-[var(--bg-glass-hover)]"
-                >
-                  <div className="flex items-center gap-3 mb-3">
-                    <div className="w-11 h-11 rounded-xl bg-[var(--accent)]/10 border border-[var(--accent)]/20 flex items-center justify-center group-hover:bg-[var(--accent)]/20 transition-colors">
-                      <Download className="w-5 h-5 text-[var(--accent)]" />
-                    </div>
-                    <span className="font-display font-semibold text-[15px]">
-                      {downloading ? '下载中...' : '下载视频'}
-                    </span>
-                  </div>
-                  <p className="text-xs text-[var(--text-dim)] leading-relaxed">
-                    {video.bvid ? '小文件网页下载，大文件本机下载' : '查看本机下载步骤与指令'}
-                  </p>
-                  {downloading && (
-                    <div className="mt-4 h-1 bg-[var(--bg-glass)] rounded-full overflow-hidden">
-                      <div className="h-full bg-gradient-to-r from-[var(--accent-deep)] to-[var(--accent)] rounded-full shimmer" style={{ width: '100%' }} />
-                    </div>
-                  )}
-                </button>
-
-                <button
-                  onClick={generateTutorial} disabled={tutorialLoading}
-                  className="glass glow-border rounded-2xl p-5 sm:p-6 text-left group transition-all disabled:opacity-30 hover:bg-[var(--bg-glass-hover)]"
-                >
-                  <div className="flex items-center gap-3 mb-3">
-                    <div className="w-11 h-11 rounded-xl bg-[var(--gold)]/10 border border-[var(--gold)]/20 flex items-center justify-center group-hover:bg-[var(--gold)]/20 transition-colors">
-                      <Sparkles className="w-5 h-5 text-[var(--gold)]" />
-                    </div>
-                    <span className="font-display font-semibold text-[15px]">
-                      {tutorialLoading ? 'AI 生成中...' : 'AI 教程'}
-                    </span>
-                  </div>
-                  <p className="text-xs text-[var(--text-dim)] leading-relaxed">
-                    {video.hasSubtitles ? '根据视频或所选字幕生成学习笔记' : '尝试提取视频内容，也可粘贴字幕'}
-                  </p>
-                  {tutorialLoading && (
-                    <div className="mt-4 h-1 bg-[var(--bg-glass)] rounded-full overflow-hidden">
-                      <div className="h-full bg-gradient-to-r from-[var(--gold)] to-[#fbbf24] rounded-full shimmer" style={{ width: '100%' }} />
-                    </div>
-                  )}
-                </button>
-              </div>
-
-              <details className="glass rounded-xl p-4" open={!!tutorialError}>
-                <summary className="text-sm cursor-pointer text-[var(--text-secondary)]">字幕来源 · 可选择语言或粘贴文本</summary>
-                <div className="mt-4 space-y-3">
-                  <label htmlFor="subtitle" className="block text-xs text-[var(--text-secondary)]">内容来源</label>
-                  <select id="subtitle" value={subtitleIndex} onChange={e => setSubtitleIndex(e.target.value)} disabled={tutorialLoading} className="bg-[var(--bg-deep)] rounded-lg p-2 text-sm w-full">
-                    <option value="auto">自动提取视频内容</option>{video.subtitles.map((s, i) => <option key={s.lan + i} value={i}>{s.lan_doc} · 平台字幕</option>)}
-                  </select>
-                  {video.subtitleNotice && <p className="text-xs text-[var(--text-secondary)]">{video.subtitleNotice}</p>}
-                  <label htmlFor="transcript" className="block text-xs text-[var(--text-secondary)]">粘贴实际字幕或转录文本（优先使用，最多 60000 字符）</label>
-                  <textarea id="transcript" maxLength={60000} rows={5} value={transcript} disabled={tutorialLoading} onChange={e => setTranscript(e.target.value)} placeholder="没有平台字幕？将视频的字幕或转录内容粘贴到这里，再点击 AI 教程。" className="w-full bg-[var(--bg-deep)] border border-[var(--border)] rounded-xl p-3 text-sm" />
-                  <p className="text-xs text-[var(--text-secondary)]">只根据实际内容生成笔记，不会把简介当作完整视频字幕。</p>
-                </div>
-              </details>
-
-              {/* Download Result */}
-              <AnimatePresence>
-                {downloadResult && (
-                  <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
-                    className="glass rounded-2xl p-5">
-                    {downloadResult.mode === 'success' && (
-                      <div className="flex items-center gap-3 text-[var(--success)]">
-                        <Check className="w-5 h-5" />
-                        <span className="font-medium">{downloadResult.message}</span>
-                      </div>
-                    )}
-                    {downloadResult.mode === 'fallback' && (
-                      <div>
-                        <p className="text-sm text-[var(--text-secondary)] mb-3">⚠️ {downloadResult.message}</p>
-                        <div className="relative">
-                          <code className="block font-mono text-xs text-[var(--success)] bg-black/40 rounded-xl p-4 pr-16 overflow-x-auto border border-[var(--border)]">
-                            {downloadResult.command}
-                          </code>
-                          <button
-                            onClick={() => copy(downloadResult.command || '', 'dl-cmd')}
-                            className="absolute top-3 right-3 text-xs bg-white/5 hover:bg-white/10 px-2.5 py-1.5 rounded-lg transition-colors"
-                          >
-                            {copied === 'dl-cmd' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                    {downloadResult.mode === 'error' && (
-                      <div className="flex items-center gap-3 text-[var(--danger)]">
-                        <AlertCircle className="w-5 h-5" />
-                        <span className="text-sm">{downloadResult.message}</span>
-                      </div>
-                    )}
-                  </motion.div>
-                )}
-              </AnimatePresence>
-
-              {/* ─── Tabs ─── */}
-              {video && (
-                <div role="tablist" aria-label="结果内容" className="flex gap-1 p-1.5 glass rounded-xl">
-                  {[
-                    { key: 'download' as const, icon: FileText, label: '下载指令' },
-                    { key: 'tutorial' as const, icon: Sparkles, label: 'AI 教程' },
-                  ].map(tab => (
+              {legacy.length > 0 && (
+                <details className="legacy-history">
+                  <summary>之前打开过的视频</summary>
+                  {legacy.map((item) => (
                     <button
-                      key={tab.key} role="tab" aria-selected={activeTab === tab.key}
-                      onClick={() => setActiveTab(tab.key)}
-                      className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-lg text-sm font-medium transition-all ${activeTab === tab.key
-                        ? 'bg-[var(--bg-glass-hover)] text-[var(--text-primary)] shadow-sm'
-                        : 'text-[var(--text-dim)] hover:text-[var(--text-secondary)]'
-                        }`}
+                      className="text-button"
+                      key={item.url}
+                      onClick={() => openVideo(item.url)}
                     >
-                      <tab.icon className="w-4 h-4" />
-                      {tab.label}
+                      {item.title}
+                      <ArrowRight size={13} />
                     </button>
                   ))}
-                </div>
+                </details>
               )}
-
-              {/* Download Commands Tab */}
-              {activeTab === 'download' && (
-                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-3">
-                  <details className="glass rounded-xl p-4" open={downloadResult?.mode === 'fallback'}>
-                    <summary className="text-sm cursor-pointer">第一次下载？先完成这两步</summary>
-                    <ol className="text-sm text-[var(--text-secondary)] list-decimal pl-5 mt-3 space-y-3">
-                      <li>安装下载工具和音视频合并工具。Mac（已安装 Homebrew）：<code className="block mt-2 p-3 bg-black/30 rounded-lg overflow-x-auto">brew install yt-dlp ffmpeg</code>Windows（PowerShell）：<code className="block mt-2 p-3 bg-black/30 rounded-lg overflow-x-auto">winget install --id yt-dlp.yt-dlp -e</code><code className="block mt-2 p-3 bg-black/30 rounded-lg overflow-x-auto">winget install --id Gyan.FFmpeg -e</code><a href="https://github.com/yt-dlp/yt-dlp#installation" target="_blank" rel="noopener noreferrer" className="inline-block mt-2 text-[var(--accent)]">查看完整安装说明</a></li>
-                      <li>复制下方指令，在终端粘贴并运行。文件保存在终端当前文件夹；最高画质通常需要 FFmpeg。</li>
-                      <li>如果提示需要登录，在指令的 <code>yt-dlp</code> 后加入 <code>--cookies-from-browser chrome</code>，并先在本机 Chrome 登录视频网站。登录状态只在本机使用。</li>
-                    </ol>
-                  </details>
-                  {[
-                    { label: '最高画质', icon: '🎬', cmd: downloadCommand(video.url) },
-                    { label: '仅音频', icon: '🎵', cmd: downloadCommand(video.url, 'audio') },
-                    ...([
-                      { label: '字幕', icon: '💬', cmd: downloadCommand(video.url, 'subtitle') },
-                    ]),
-                  ].map(item => (
-                    <div key={item.label} className="glass rounded-xl p-4 hover:bg-[var(--bg-glass-hover)] transition-colors">
-                      <div className="flex justify-between items-center mb-2.5">
-                        <span className="text-sm text-[var(--text-secondary)] flex items-center gap-2">
-                          <span>{item.icon}</span> {item.label}
-                        </span>
-                        <button onClick={() => copy(item.cmd, item.label)}
-                          className="flex items-center gap-1.5 text-xs text-[var(--text-dim)] hover:text-[var(--accent)] transition-colors px-2 py-1 rounded-md hover:bg-[var(--bg-glass)]">
-                          {copied === item.label ? <><Check className="w-3 h-3" /> 已复制</> : <><Copy className="w-3 h-3" /> 复制</>}
-                        </button>
-                      </div>
-                      <code className="block font-mono text-xs text-[var(--success)] bg-black/30 rounded-lg p-3 overflow-x-auto border border-[var(--border)]">{item.cmd}</code>
-                    </div>
-                  ))}
-                </motion.div>
-              )}
-
-              {/* Tutorial Tab */}
-              {activeTab === 'tutorial' && (
-                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
-                  ref={tutorialRef}
-                  className="glass-elevated rounded-2xl p-6 sm:p-8 max-h-[70vh] overflow-y-auto"
+            </section>
+          ) : (
+            <>
+              <div className="workspace-toolbar">
+                <form
+                  className="compact-import"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    openVideo(input);
+                  }}
                 >
-                  <div className="flex flex-wrap items-center justify-between gap-3 mb-4 text-xs text-[var(--text-secondary)]" role="status" aria-live="polite">
-                    <span>{tutorialLoading ? tutorialStatus : tutorialError ? '生成未完成' : tutorialText ? '生成完成' : '准备生成'}{tutorialSource && ` · ${tutorialSource}`}</span>
-                    {tutorialLoading && <button onClick={() => tutorialAbort.current?.abort()} className="text-[var(--accent)]">停止生成</button>}
+                  <Plus size={16} />
+                  <input
+                    aria-label="视频链接"
+                    placeholder="打开其他视频：链接或 BV 号"
+                    value={input}
+                    onChange={(event) => setInput(event.target.value)}
+                  />
+                  <button
+                    className="text-button"
+                    disabled={opening || !input.trim()}
+                  >
+                    {opening ? <Loader2 size={15} className="spin" /> : "打开"}
+                  </button>
+                </form>
+                <button
+                  className="text-button"
+                  onClick={() => setSourceOpen(true)}
+                >
+                  来源与视频信息 <ExternalLink size={14} />
+                </button>
+              </div>
+              {inputError && (
+                <p className="input-error workspace-error" role="alert">
+                  {inputError}
+                </p>
+              )}
+              <div className="workspace">
+                <aside className="course-sidebar">{navigation}</aside>
+                <section
+                  className="learning-document"
+                  ref={contentRef}
+                  tabIndex={-1}
+                  aria-label="当前节学习笔记"
+                >
+                  <div className="document-kicker">
+                    <span>
+                      P{String(active.video.selectedPage || 1).padStart(2, "0")}{" "}
+                      <span className="muted">
+                        / {active.video.pages?.length || 1}
+                      </span>
+                    </span>
+                    <span>
+                      {active.video.duration
+                        ? duration(active.video.duration)
+                        : "时长未提供"}
+                    </span>
+                    {(active.video.pages?.length || 0) > 1 && (
+                      <button
+                        className="directory-button text-button"
+                        onClick={() => setDirectoryOpen(true)}
+                      >
+                        <List size={16} />
+                        课程目录
+                      </button>
+                    )}
                   </div>
-                  {tutorialError && <div role="alert" className="text-sm text-[var(--danger)] mb-4">{tutorialError}<button disabled={tutorialLoading} onClick={generateTutorial} className="ml-3 underline">重试</button></div>}
-                  {tutorialText ? (
-                    <div className={`tutorial-content ${tutorialLoading ? 'typing-cursor' : ''}`}>
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{tutorialMarkdown(tutorialText)}</ReactMarkdown>
+                  <h1 className="document-title">{partName(active.video)}</h1>
+                  <button
+                    className="source-strip"
+                    onClick={() => {
+                      setSelectedCue("");
+                      setSourceOpen(true);
+                    }}
+                  >
+                    <ShieldCheck size={16} />
+                    <span>
+                      {shownNote?.source ||
+                        (active.transcript.trim()
+                          ? "你提供的字幕文本"
+                          : active.video.hasSubtitles
+                            ? "当前节有平台字幕"
+                            : needsSource
+                              ? "当前节需要补充内容"
+                              : "可尝试自动提取内容")}
+                      <small>
+                        {shownNote
+                          ? coverage(shownNote.evidence)
+                          : needsSource
+                            ? "取得实际内容后再整理"
+                            : "只根据读取到的内容生成"}
+                      </small>
+                    </span>
+                    <ChevronDown size={16} />
+                  </button>
+                  {shownNote?.evidence?.limitation && (
+                    <p className="coverage-notice">
+                      {shownNote.evidence.limitation}
+                    </p>
+                  )}
+                  <div className="document-actions">
+                    <div>
+                      {active.generationState === "running" ? (
+                        <div className="generation-status" role="status">
+                          <Loader2 size={17} className="spin" />
+                          <span>
+                            {job?.id === active.id ? job.status : "正在整理…"}
+                          </span>
+                          <button
+                            className="secondary"
+                            onClick={() => jobRef.current?.controller.abort()}
+                          >
+                            <Square size={13} />
+                            停止生成
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          className={shownNote?.text ? "secondary" : "primary"}
+                          disabled={!!job || opening}
+                          onClick={() =>
+                            needsSource ? setSourceOpen(true) : generate()
+                          }
+                        >
+                          {needsSource ? (
+                            <Plus size={16} />
+                          ) : (
+                            <Sparkles size={16} />
+                          )}
+                          {needsSource
+                            ? "补充字幕"
+                            : shownNote?.text
+                              ? "重新生成"
+                              : active.transcriptOffset > 0 ||
+                                  totalCharacters > 20000
+                                ? "整理所选片段"
+                                : "生成学习笔记"}
+                        </button>
+                      )}
+                    </div>
+                    <button
+                      className="text-button"
+                      onClick={() => setDownloadOpen(true)}
+                    >
+                      <ArrowDownToLine size={15} />
+                      保存视频
+                    </button>
+                  </div>
+                  {job && job.id !== active.id && (
+                    <p className="small muted">
+                      另一节正在生成，完成或停止后可整理这一节。
+                    </p>
+                  )}
+                  {shownNote?.error && !generationError && (
+                    <div className="notice" role="alert">
+                      <strong>这份内容未完成</strong>
+                      <p>{shownNote.error}</p>
+                    </div>
+                  )}
+                  {(generationError ||
+                    active.generationState === "interrupted") && (
+                    <div className="notice" role="alert">
+                      <strong>这次生成未完成</strong>
+                      <p>
+                        {generationError ||
+                          "上次生成被中断，已保存的内容仍在。"}
+                      </p>
+                      <button
+                        className="text-button"
+                        disabled={!!job}
+                        onClick={() =>
+                          needsSource ? setSourceOpen(true) : generate()
+                        }
+                      >
+                        {needsSource ? "补充字幕" : "重试"}
+                      </button>
+                      <button
+                        className="text-button"
+                        onClick={() => setSourceOpen(true)}
+                      >
+                        检查内容来源
+                      </button>
+                    </div>
+                  )}
+                  {priorNote && (
+                    <div className="version-switch">
+                      <span>
+                        {showPrevious
+                          ? "正在查看上一版"
+                          : active.draft?.text
+                            ? "未完成草稿 · 原笔记已保留"
+                            : "当前版本"}
+                      </span>
+                      <button
+                        className="text-button"
+                        onClick={() => setShowPrevious((value) => !value)}
+                      >
+                        <Undo2 size={14} />
+                        {showPrevious ? "查看当前内容" : "查看上一版"}
+                      </button>
+                    </div>
+                  )}
+                  {shownNote?.text ? (
+                    <article className="note-content">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        urlTransform={(url) =>
+                          /^source:\d+$/.test(url)
+                            ? url
+                            : defaultUrlTransform(url)
+                        }
+                        components={{
+                          a: ({ href, children }) =>
+                            href?.startsWith("source:") ? (
+                              sourceCues.some(
+                                (cue) => cue.id === href.slice(7),
+                              ) ? (
+                                <button
+                                  className="citation"
+                                  onClick={() => openCitation(href.slice(7))}
+                                >
+                                  {children}
+                                  <ExternalLink size={11} />
+                                </button>
+                              ) : (
+                                <span>{children}</span>
+                              )
+                            ) : (
+                              <a
+                                href={href}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                              >
+                                {children}
+                              </a>
+                            ),
+                        }}
+                      >
+                        {tutorialMarkdown(shownNote.text)}
+                      </ReactMarkdown>
+                    </article>
+                  ) : active.generationState === "running" ? (
+                    <div className="preparing">
+                      <div className="skeleton-line" />
+                      <div className="skeleton-line" />
+                      <div className="skeleton-line short" />
+                      <p>取得实际内容后，笔记会出现在这里。</p>
                     </div>
                   ) : (
-                    <div className="text-center py-16 text-[var(--text-dim)]">
-                      <div className="w-16 h-16 rounded-2xl bg-[var(--gold)]/5 border border-[var(--gold)]/10 flex items-center justify-center mx-auto mb-4">
-                        <Sparkles className="w-7 h-7 opacity-40 text-[var(--gold)]" />
+                    <div className="empty-document">
+                      <BookOpen size={30} />
+                      <h2>
+                        {needsSource
+                          ? "先把这一节的内容补上"
+                          : "把这一节留下来"}
+                      </h2>
+                      <p>
+                        {needsSource
+                          ? "目前无法读取这一节的字幕。粘贴实际字幕或转录文本，就能继续整理。"
+                          : "整理本节目的、关键知识和原文中的步骤。你的笔记与备注会自动保存在这台设备。"}
+                      </p>
+                      <div>
+                        <span>有依据的要点</span>
+                        <span>可恢复的笔记</span>
+                        <span>自己的理解</span>
                       </div>
-                      <p className="text-sm">{tutorialLoading ? tutorialStatus : tutorialError ? '可展开「字幕来源」粘贴实际字幕后重试' : '点击上方「AI 教程」按钮开始'}</p>
                     </div>
                   )}
-                  {tutorialText && !tutorialLoading && (
-                    <div className="mt-6 pt-4 flex flex-wrap gap-4 border-t border-[var(--border)]">
-                      <button onClick={() => copy(tutorialMarkdown(tutorialText), 'tutorial')}
-                        className="text-sm text-[var(--accent)] hover:text-[var(--accent-bright)] flex items-center gap-2 transition-colors">
-                        {copied === 'tutorial' ? <><Check className="w-4 h-4" /> 已复制完整教程</> : <><Copy className="w-4 h-4" /> 复制学习笔记 (Markdown)</>}
+                  {shownNote?.text && (
+                    <div className="note-tools">
+                      <span className="small muted">
+                        {shownNote.status === "partial"
+                          ? "未完成内容"
+                          : "生成完成"}{" "}
+                        ·{" "}
+                        {new Date(shownNote.generatedAt).toLocaleDateString(
+                          "zh-CN",
+                        )}
+                      </span>
+                      <button className="text-button" onClick={copyNote}>
+                        {copied ? <Check size={15} /> : <Copy size={15} />}
+                        {copied ? "已复制" : "复制笔记"}
                       </button>
-                      <button onClick={exportTutorial} className="text-sm text-[var(--accent)] flex items-center gap-2"><Download className="w-4 h-4" />导出 Markdown</button>
+                      <button
+                        className="text-button"
+                        onClick={() => exportNote()}
+                      >
+                        <ArrowDownToLine size={15} />
+                        导出 Markdown
+                      </button>
                     </div>
                   )}
-                </motion.div>
-              )}
-
-            </motion.div>
+                  <section className="personal-memo">
+                    <label htmlFor="personal-memo">
+                      <span className="memo-icon">✎</span>
+                      <strong>我的备注</strong>
+                      <span>留下自己的理解</span>
+                    </label>
+                    <textarea
+                      id="personal-memo"
+                      value={active.memo}
+                      maxLength={20000}
+                      rows={4}
+                      placeholder="这一节对我有什么用？记录自己的理解、实践结果，或下次要试的事。"
+                      onChange={(event) =>
+                        updateDocument(active.id, (value) => ({
+                          ...value,
+                          memo: event.target.value,
+                          updatedAt: Date.now(),
+                        }))
+                      }
+                    />
+                    <div className="small muted">
+                      独立保存，重新生成也会保留。
+                      {active.memo.length > 18000 &&
+                        ` ${active.memo.length}/20000`}
+                    </div>
+                  </section>
+                  {nextPart && (
+                    <button
+                      className="next-lesson"
+                      onClick={() =>
+                        openVideo(partUrl(active.video, nextPart.page))
+                      }
+                    >
+                      <span className="small muted">
+                        下一节 · P{nextPart.page}
+                        <strong>{nextPart.title}</strong>
+                      </span>
+                      <ArrowRight size={20} />
+                    </button>
+                  )}
+                </section>
+              </div>
+            </>
           )}
-        </AnimatePresence>
-      </div>
-
-      {/* ═══════════ FOOTER — Minimal, structured ═══════════ */}
-      <footer className="relative z-10 border-t border-[var(--border)]">
-        <div className="max-w-4xl mx-auto px-4 sm:px-6 py-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-[11px] tracking-[0.1em] uppercase text-[var(--text-dim)]">
-          <p className="flex items-center gap-3">
-            Powered by{' '}
-            <a href="https://github.com/yt-dlp/yt-dlp" className="text-[var(--accent)] hover:text-[var(--accent-bright)] transition-colors" target="_blank" rel="noopener noreferrer">yt-dlp</a>
-            <span className="text-[var(--border)]">·</span> B 站 API
-            <span className="text-[var(--border)]">·</span> Qwen AI
-          </p>
-          <p>仅供学习交流使用</p>
-        </div>
+        </>
+      )}
+      <footer className="footer">
+        <span>BiliHelper · 看过的内容，也可以留下来。</span>
+        <span>笔记保存在本机 · 支持 Markdown 导出</span>
       </footer>
+      {job && (
+        <div className="generation-dock">
+          <Loader2 size={16} className="spin" />
+          <span>
+            P{workspace.documents[job.id]?.video.selectedPage || 1} ·{" "}
+            {job.status}
+          </span>
+          {job.id !== active?.id && (
+            <button className="text-button" onClick={() => openSaved(job.id)}>
+              查看笔记
+            </button>
+          )}
+          <button
+            className="text-button"
+            aria-label="停止当前生成"
+            onClick={() => jobRef.current?.controller.abort()}
+          >
+            停止
+          </button>
+        </div>
+      )}
+      {notice && (
+        <div className="toast" role="status">
+          {notice}
+          <button className="text-button" onClick={() => setNotice("")}>
+            知道了
+          </button>
+        </div>
+      )}
+      {deleted && (
+        <div className="toast" role="status">
+          已删除这一份笔记
+          <button
+            className="text-button"
+            onClick={() => {
+              const item = deleted;
+              commit((state) => ({
+                ...state,
+                documents: { ...state.documents, [item.id]: item },
+                activeId: item.id,
+              }));
+              setDeleted(undefined);
+              setHome(false);
+            }}
+          >
+            <Undo2 size={14} />
+            撤销
+          </button>
+          <button className="text-button" onClick={() => setDeleted(undefined)}>
+            关闭
+          </button>
+        </div>
+      )}
+      <Modal
+        open={libraryOpen}
+        onClose={() => setLibraryOpen(false)}
+        title="我的笔记"
+      >
+        <p className="muted small">
+          笔记、备注和输入草稿保存在这台设备，暂不跨设备同步。
+        </p>
+        <label className="search-field">
+          <Search size={16} />
+          <input
+            aria-label="查找我的笔记"
+            placeholder="按视频或节名称查找"
+            value={librarySearch}
+            onChange={(event) => setLibrarySearch(event.target.value)}
+          />
+        </label>
+        <div className="library-list">
+          {allDocuments
+            .filter((item) =>
+              `${item.video.title} ${partName(item.video)} ${item.memo}`
+                .toLowerCase()
+                .includes(librarySearch.toLowerCase()),
+            )
+            .map((item) => (
+              <div className="library-item" key={item.id}>
+                <button onClick={() => openSaved(item.id)}>
+                  <span>
+                    P{item.video.selectedPage || 1} · {noteState(item)}
+                  </span>
+                  <strong>{partName(item.video)}</strong>
+                  <small>
+                    {item.video.uploader} ·{" "}
+                    {new Date(item.updatedAt).toLocaleDateString("zh-CN")}
+                  </small>
+                </button>
+                <button
+                  className="icon-button"
+                  aria-label={`导出 ${partName(item.video)}`}
+                  onClick={() =>
+                    exportNote(item, item.draft?.text ? item.draft : item.note)
+                  }
+                >
+                  <ArrowDownToLine size={17} />
+                </button>
+                <button
+                  className="icon-button"
+                  aria-label={`删除 ${partName(item.video)}`}
+                  onClick={() => removeDocument(item)}
+                >
+                  <Trash2 size={17} />
+                </button>
+              </div>
+            ))}
+          {!allDocuments.length && (
+            <div className="empty-library">
+              <Library size={26} />
+              <p>还没有笔记。先打开一节视频。</p>
+            </div>
+          )}
+        </div>
+        {allDocuments.length > 0 && (
+          <button
+            className="text-button danger"
+            onClick={() => setClearOpen(true)}
+          >
+            清除全部本机数据
+          </button>
+        )}
+      </Modal>
+      <Modal
+        open={directoryOpen}
+        onClose={() => setDirectoryOpen(false)}
+        title="课程目录"
+      >
+        {navigation}
+      </Modal>
+      <Modal
+        open={sourceOpen}
+        onClose={() => setSourceOpen(false)}
+        title="内容来源与视频信息"
+      >
+        {active && (
+          <>
+            <div className="source-video">
+              <h3>{active.video.title}</h3>
+              <p className="muted">
+                P{active.video.selectedPage || 1} · {partName(active.video)}
+              </p>
+              <a
+                className="text-button"
+                href={active.video.url}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                打开原视频 <ExternalLink size={14} />
+              </a>
+              <p className="small muted">
+                {active.video.uploader} ·{" "}
+                {active.video.duration
+                  ? duration(active.video.duration)
+                  : "时长未提供"}
+              </p>
+              <details>
+                <summary>视频简介</summary>
+                <p className="description">
+                  {active.video.description || "暂无简介"}
+                </p>
+              </details>
+            </div>
+            {focusCue && (
+              <div className="focused-cue">
+                <span className="eyebrow">这条内容的出处</span>
+                <p>{focusCue.text}</p>
+                {focusCue.start !== undefined ? (
+                  <a
+                    className="text-button"
+                    href={cueUrl(active.video, focusCue)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    回看 {duration(focusCue.start)} 的片段{" "}
+                    <ExternalLink size={14} />
+                  </a>
+                ) : (
+                  <p className="small muted">这段原文没有可靠时间信息。</p>
+                )}
+              </div>
+            )}
+            <section className="tool-section">
+              <h3>用于下一次整理的材料</h3>
+              <p className="small muted">
+                修改这里不会覆盖已有笔记。个人备注也会保留。
+              </p>
+              <label htmlFor="subtitle-source">字幕来源</label>
+              <select
+                id="subtitle-source"
+                value={active.subtitleIndex}
+                disabled={active.generationState === "running"}
+                onChange={(event) =>
+                  updateDocument(active.id, (value) => ({
+                    ...value,
+                    subtitleIndex: event.target.value,
+                    transcriptOffset: 0,
+                  }))
+                }
+              >
+                <option value="auto">自动读取当前节内容</option>
+                {active.video.subtitles.map((subtitle, index) => (
+                  <option key={subtitle.lan + index} value={index}>
+                    {subtitle.lan_doc} · 平台字幕
+                  </option>
+                ))}
+              </select>
+              {active.video.subtitleNotice && (
+                <p className="small muted">{active.video.subtitleNotice}</p>
+              )}
+              {needsSource && (
+                <p className="notice">
+                  当前分 P
+                  无可读取字幕，自动提取暂不支持这一节。请粘贴这一节的实际内容。
+                </p>
+              )}
+              <label htmlFor="source-transcript">
+                粘贴字幕或转录文本（也支持 SRT / VTT）
+              </label>
+              <textarea
+                id="source-transcript"
+                maxLength={60000}
+                rows={7}
+                disabled={active.generationState === "running"}
+                placeholder="粘贴实际内容。带时间码的字幕可用于片段回看；普通文本用于核对原文。"
+                value={active.transcript}
+                onChange={(event) =>
+                  updateDocument(active.id, (value) => ({
+                    ...value,
+                    transcript: event.target.value,
+                    transcriptOffset: 0,
+                    updatedAt: Date.now(),
+                  }))
+                }
+              />
+              <p className="small muted">
+                {active.transcript.length}/60000 字符。填写后优先使用这份文本。
+              </p>
+              {totalCharacters > 20000 && (
+                <div className="range-picker">
+                  <label htmlFor="source-range">本次整理范围</label>
+                  <select
+                    id="source-range"
+                    value={active.transcriptOffset}
+                    disabled={active.generationState === "running"}
+                    onChange={(event) =>
+                      updateDocument(active.id, (value) => ({
+                        ...value,
+                        transcriptOffset: Number(event.target.value),
+                      }))
+                    }
+                  >
+                    {Array.from(
+                      { length: Math.ceil(totalCharacters / 20000) },
+                      (_, index) => (
+                        <option value={index * 20000} key={index}>
+                          第 {index + 1} 段 · 文本 {index * 20000 + 1}–
+                          {Math.min((index + 1) * 20000, totalCharacters)} 字符
+                        </option>
+                      ),
+                    )}
+                  </select>
+                  <p className="small muted">
+                    每次明确整理一个片段，原始材料完整保留。字幕格式清洗后的实际范围会显示在笔记来源中。
+                  </p>
+                </div>
+              )}
+              <div className="inline-actions">
+                <button
+                  className="primary"
+                  disabled={!!job || needsSource}
+                  onClick={() => {
+                    if (active.transcript.trim() && manualCharacters < 30) {
+                      setNotice("请粘贴至少 30 个字符的实际视频内容。");
+                      return;
+                    }
+                    setSourceOpen(false);
+                    generate();
+                  }}
+                >
+                  <Sparkles size={16} />
+                  {totalCharacters > 20000 ? "整理所选片段" : "生成学习笔记"}
+                </button>
+                <button
+                  className="text-button"
+                  disabled={opening}
+                  onClick={() => openVideo(active.video.url, true)}
+                >
+                  刷新可用来源
+                </button>
+              </div>
+              <details className="subtitle-help">
+                <summary>没有字幕，怎么办？</summary>
+                <p>
+                  可从原平台提供的字幕或转录面板复制当前这一节的文本；如果没有，可使用已有的实际转录材料。不要粘贴简介来代替字幕。
+                </p>
+                <p>
+                  在电脑上也可尝试「保存视频」中的字幕下载指令。平台没有公开字幕时，该方法可能仍不可用。
+                </p>
+              </details>
+            </section>
+            {shownNote && (
+              <section className="tool-section">
+                <h3>当前笔记的依据</h3>
+                <p>
+                  {shownNote.source || "未取得来源"} ·{" "}
+                  {coverage(shownNote.evidence)}
+                </p>
+                {shownNote.evidence?.limitation && (
+                  <p className="notice">{shownNote.evidence.limitation}</p>
+                )}
+                <p className="small muted">
+                  文本依据不包含对全部视频画面的核验。
+                </p>
+                {sourceCues.length ? (
+                  <>
+                    <label className="search-field">
+                      <Search size={15} />
+                      <input
+                        aria-label="查找来源原文"
+                        placeholder="在本次使用的原文中查找"
+                        value={sourceSearch}
+                        onChange={(event) =>
+                          setSourceSearch(event.target.value)
+                        }
+                      />
+                    </label>
+                    <div className="source-cues">
+                      {matchingCues.map((cue) => (
+                        <div
+                          key={cue.id}
+                          className={
+                            selectedCue === cue.id ? "selected-cue" : ""
+                          }
+                        >
+                          <span>
+                            {cue.start !== undefined
+                              ? duration(cue.start)
+                              : `原文 ${cue.id}`}
+                          </span>
+                          <p>{cue.text}</p>
+                          {cue.start !== undefined && (
+                            <a
+                              href={cueUrl(active.video, cue)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              aria-label={`回看 ${duration(cue.start)} 的片段`}
+                            >
+                              <ExternalLink size={14} />
+                            </a>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  <p className="muted">
+                    提取服务没有返回可核对的逐段原文，覆盖范围暂无法确认。
+                  </p>
+                )}
+              </section>
+            )}
+          </>
+        )}
+      </Modal>
+      <Modal
+        open={downloadOpen}
+        onClose={() => setDownloadOpen(false)}
+        title="保存视频"
+      >
+        {downloadOpen && active && (
+          <DownloadPanel key={active.id} video={active.video} />
+        )}
+      </Modal>
+      <Modal
+        open={clearOpen}
+        onClose={() => setClearOpen(false)}
+        title="清除全部本机数据"
+      >
+        <p>
+          这会删除这台设备保存的所有笔记、输入草稿和个人备注。请先导出重要内容。
+        </p>
+        <div className="inline-actions">
+          <button className="secondary" onClick={() => setClearOpen(false)}>
+            保留数据
+          </button>
+          <button
+            className="primary destructive"
+            disabled={!!job}
+            onClick={() => {
+              commit(() => ({ version: 1, documents: {}, activeId: null }));
+              try {
+                localStorage.removeItem("bili-history");
+              } catch {}
+              setLegacy([]);
+              setDeleted(undefined);
+              setClearOpen(false);
+              setLibraryOpen(false);
+              setHome(true);
+            }}
+          >
+            确认清除全部数据
+          </button>
+        </div>
+        {job && <p>请先停止生成，再清除数据。</p>}
+      </Modal>
     </main>
-  )
+  );
 }
