@@ -47,6 +47,140 @@ test('selects the actual cid and duration for a multi-part video and rejects mis
   assert.throws(() => biliMetadata(video, 3))
 })
 
+test('later parts never fall back to the first part when page metadata or cid is absent', () => {
+  const video = { bvid: 'BV1wD4y1o7AS', title: 'Course', cid: 111, duration: 100 }
+  assert.equal(biliMetadata(video, 1).cid, 111, 'legacy metadata without pages remains usable for P1')
+  for (const pages of [undefined, [], null, {}]) assert.throws(() => biliMetadata({ ...video, pages }, 2), /分 P 信息不完整/)
+  for (const cid of [undefined, null, 0, -2, '222', NaN, Infinity, 2.5]) {
+    assert.throws(() => biliMetadata({ ...video, pages: [{ page: 2, cid, part: 'Second', duration: 200 }] }, 2), /内容标识/)
+  }
+  assert.throws(() => biliMetadata({ ...video, cid: 0 }, 1), /内容标识/)
+})
+
+function loadTypeScript(relative, mocks = {}, globals = {}) {
+  const ts = require('typescript')
+  const { readFileSync } = require('node:fs')
+  const output = ts.transpileModule(readFileSync(path.join(__dirname, '..', relative), 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  const module = { exports: {} }
+  const localRequire = name => {
+    if (Object.prototype.hasOwnProperty.call(mocks, name)) return mocks[name]
+    if (name.endsWith('/video-url')) return require(path.join(compiled, 'video-url.js'))
+    if (name.endsWith('/bili-metadata')) return require(path.join(compiled, 'bili-metadata.js'))
+    throw new Error(`Unexpected import: ${name}`)
+  }
+  new Function('require', 'module', 'exports', ...Object.keys(globals), output)(localRequire, module, module.exports, ...Object.values(globals))
+  return module.exports
+}
+
+function browserApi(onScript) {
+  const window = Object.create(null), scripts = []
+  const document = {
+    createElement: () => ({ removed: false, remove() { this.removed = true } }),
+    head: { appendChild(script) { scripts.push(script); onScript?.(script, window) } },
+  }
+  return { ...loadTypeScript('lib/browser-bili.ts', {}, { window, document, crypto: require('node:crypto').webcrypto }), window, scripts }
+}
+
+test('browser subtitle refresh uses the current cid and filters untrusted asset URLs', async () => {
+  const api = browserApi((script, window) => {
+    const request = new URL(script.src)
+    assert.equal(request.origin, 'https://api.bilibili.com')
+    assert.equal(request.pathname, '/x/player/v2')
+    assert.equal(request.searchParams.get('cid'), '222')
+    queueMicrotask(() => window[request.searchParams.get('callback')]({ code: 0, data: { subtitle: { subtitles: [
+      { lan: 'zh', lan_doc: '中文', subtitle_url: '//i0.hdslb.com/subtitles/current.json' },
+      { lan: 'en', lan_doc: 'English', subtitle_url: 'https://evil.test/subtitle.json' }, null,
+    ] } } }))
+  })
+  const subtitles = await api.browserSubtitles('BV1wD4y1o7AS', 222, new AbortController().signal)
+  assert.deepEqual(subtitles, [{ lan: 'zh', lan_doc: '中文', subtitle_url: 'https://i0.hdslb.com/subtitles/current.json' }])
+  assert.equal(api.scripts[0].removed, true)
+  assert.equal(Object.keys(api.window).length, 0)
+})
+
+test('browser subtitle refresh propagates platform and cancellation failures instead of reporting no subtitles', async () => {
+  const denied = browserApi((script, window) => queueMicrotask(() => window[new URL(script.src).searchParams.get('callback')]({ code: -101, message: '账号未登录' })))
+  await assert.rejects(denied.browserSubtitles('BV1wD4y1o7AS', 222, new AbortController().signal), /账号未登录/)
+  const malformed = browserApi((script, window) => queueMicrotask(() => window[new URL(script.src).searchParams.get('callback')]({ code: 0, data: 'invalid player data' })))
+  await assert.rejects(malformed.browserSubtitles('BV1wD4y1o7AS', 222, new AbortController().signal), /格式异常/)
+  const pending = browserApi(), controller = new AbortController()
+  const request = pending.browserSubtitles('BV1wD4y1o7AS', 222, controller.signal)
+  controller.abort()
+  await assert.rejects(request, /已停止/)
+  assert.equal(pending.scripts[0].removed, true)
+  assert.equal(Object.keys(pending.window).length, 0)
+  await assert.rejects(pending.browserSubtitles('BV1wD4y1o7AS&cid=1', 222, new AbortController().signal), /信息无效/)
+  await assert.rejects(pending.browserSubtitles('BV1wD4y1o7AS', 0, new AbortController().signal), /信息无效/)
+  assert.equal(pending.scripts.length, 1, 'invalid identifiers must not issue JSONP requests')
+})
+
+class MetadataHttpError extends Error {
+  constructor(message, status = 502) { super(message); this.status = status }
+}
+function metadataRoute(biliJson, biliWbiJson) {
+  return loadTypeScript('app/api/video-info/route.ts', {
+    '../../../lib/upstream': { biliJson, biliWbiJson, biliHeaders: {}, HttpError: MetadataHttpError,
+      errorResponse: error => Response.json({ error: error.message }, { status: error.status || 500 }),
+      requestJson: async () => { throw new Error('Unexpected request') } },
+  })
+}
+const metadataVideo = { bvid: 'BV1wD4y1o7AS', title: 'Course', cid: 111, duration: 100,
+  owner: { name: 'Teacher' }, pages: [{ page: 1, cid: 111, part: 'Intro', duration: 100 }, { page: 2, cid: 222, part: 'Install', duration: 200 }] }
+const metadataRequest = () => new Request('https://example.test/api/video-info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: 'https://www.bilibili.com/video/BV1wD4y1o7AS?p=2' }) })
+
+test('metadata route tries the signed official player endpoint with the selected part after v2 fails', async () => {
+  const calls = []
+  const route = metadataRoute(async endpoint => {
+    calls.push(endpoint)
+    if (endpoint.startsWith('/x/web-interface/view')) return metadataVideo
+    throw new MetadataHttpError('平台拒绝访问')
+  }, async (endpoint, parameters) => {
+    calls.push({ endpoint, parameters })
+    return { subtitle: { subtitles: [
+      { lan: 'zh', lan_doc: '中文', subtitle_url: '//i0.hdslb.com/subtitles/p2.json' },
+      { lan: 'en', lan_doc: 'English', subtitle_url: 'https://evil.test/subtitles.json' },
+    ] } }
+  })
+  const response = await route.POST(metadataRequest()), data = await response.json()
+  assert.equal(response.status, 200)
+  assert.equal(calls[1], '/x/player/v2?bvid=BV1wD4y1o7AS&cid=222')
+  assert.deepEqual(calls[2], { endpoint: '/x/player/wbi/v2', parameters: { bvid: 'BV1wD4y1o7AS', cid: 222 } })
+  assert.equal(data.cid, 222)
+  assert.equal(data.uploader, 'Teacher')
+  assert.equal(data.duration, 200)
+  assert.equal(data.hasSubtitles, true)
+  assert.deepEqual(data.subtitles, [{ lan: 'zh', lan_doc: '中文', subtitle_url: 'https://i0.hdslb.com/subtitles/p2.json' }])
+})
+
+test('metadata stays available with an explicit notice when both subtitle queries fail', async () => {
+  const route = metadataRoute(async endpoint => {
+    if (endpoint.startsWith('/x/web-interface/view')) return metadataVideo
+    throw new MetadataHttpError('v2 failed')
+  }, async () => { throw new MetadataHttpError('signed player failed') })
+  const response = await route.POST(metadataRequest()), data = await response.json()
+  assert.equal(response.status, 200)
+  assert.equal(data.title, 'Course')
+  assert.equal(data.selectedPage, 2)
+  assert.equal(data.hasSubtitles, false)
+  assert.deepEqual(data.subtitles, [])
+  assert.match(data.subtitleNotice, /查询暂不可用.*刷新来源/)
+})
+
+test('metadata route refuses an unverifiable later part before any subtitle request', async () => {
+  let calls = 0
+  const route = metadataRoute(async endpoint => {
+    calls++
+    assert.match(endpoint, /^\/x\/web-interface\/view/)
+    return { ...metadataVideo, pages: [] }
+  }, async () => { throw new Error('Must not request P1 subtitles') })
+  const response = await route.POST(metadataRequest())
+  assert.equal(response.status, 400)
+  assert.match((await response.json()).error, /分 P 信息不完整/)
+  assert.equal(calls, 1)
+})
+
 const { tutorialMarkdown } = require(path.join(compiled, 'markdown.js'))
 test('renders provider Markdown wrappers while retaining nested programming examples', () => {
   const document = '# 标题\n\n```python\nprint("ok")\n```'

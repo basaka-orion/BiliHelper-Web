@@ -23,7 +23,8 @@ import {
   Trash2,
   Undo2,
 } from "lucide-react";
-import { browserVideoInfo } from "../lib/browser-bili";
+import { browserVideoInfo, browserSubtitles } from "../lib/browser-bili";
+import { refreshVideoSource } from "../lib/refresh-video-source";
 import { parseVideoLink } from "../lib/video-url";
 import { readSSE } from "../lib/sse";
 import { tutorialMarkdown } from "../lib/markdown";
@@ -280,8 +281,31 @@ export default function Home() {
         } else video = data;
       }
       if (controller.signal.aborted || !video) return;
-      const metadata = video,
-        nextId = documentId(metadata.url);
+      let metadata = video;
+      const nextId = documentId(metadata.url);
+      let refreshedIndex: string | undefined;
+      if (refresh && metadata.platform === "bilibili") {
+        const previous = current.current.documents[nextId];
+        const refreshed = await refreshVideoSource(
+          metadata,
+          previous?.subtitleIndex || "auto",
+          controller.signal,
+          browserSubtitles,
+          async (url, signal) =>
+            json(
+              await fetch("/api/video-info", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                signal,
+                body: JSON.stringify({ url }),
+              }),
+            ),
+          previous?.video.subtitles[Number(previous.subtitleIndex)]?.lan,
+        );
+        metadata = refreshed.video;
+        refreshedIndex = refreshed.selected;
+      }
+      if (controller.signal.aborted) return;
       commit((state) => {
         const existing = state.documents[nextId];
         return {
@@ -290,7 +314,11 @@ export default function Home() {
           documents: {
             ...state.documents,
             [nextId]: existing
-              ? { ...existing, video: metadata }
+              ? {
+                  ...existing,
+                  video: metadata,
+                  subtitleIndex: refreshedIndex ?? existing.subtitleIndex,
+                }
               : createDocument(metadata),
           },
         };
@@ -346,7 +374,7 @@ export default function Home() {
       draft: { text: "", source: "", status: "partial", generatedAt },
     }));
     contentRef.current?.focus({ preventScroll: true });
-    const timeout = setTimeout(() => controller.abort(), 65000);
+    const timeout = setTimeout(() => controller.abort(), 210000);
     const storeDraft = (error?: string) =>
       updateDocument(id, (value) => ({
         ...value,
@@ -360,10 +388,39 @@ export default function Home() {
         },
       }));
     try {
+      let sourceVideo = snapshot.video,
+        subtitleIndex = snapshot.subtitleIndex;
+      if (!snapshot.transcript.trim() && sourceVideo.platform === "bilibili") {
+        setJob({ id, status: "正在重新检查本节字幕…" });
+        const refreshed = await refreshVideoSource(
+          sourceVideo,
+          subtitleIndex,
+          controller.signal,
+          browserSubtitles,
+          async (url, signal) =>
+            json(
+              await fetch("/api/video-info", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                signal,
+                body: JSON.stringify({ url }),
+              }),
+            ),
+        );
+        sourceVideo = refreshed.video;
+        subtitleIndex = refreshed.selected;
+        if (snapshot.subtitleIndex !== "auto" && subtitleIndex === "auto")
+          setNotice("原先选择的字幕已不可用，已切换为自动读取本节内容。");
+        updateDocument(id, (value) => ({
+          ...value,
+          video: sourceVideo,
+          subtitleIndex,
+        }));
+      }
       const subtitle =
-        snapshot.subtitleIndex === "auto"
-          ? snapshot.video.subtitles[0]
-          : snapshot.video.subtitles[Number(snapshot.subtitleIndex)];
+        subtitleIndex === "auto"
+          ? sourceVideo.subtitles[0]
+          : sourceVideo.subtitles[Number(subtitleIndex)];
       const response = await fetch("/api/tutorial", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -374,7 +431,7 @@ export default function Home() {
           transcript: snapshot.transcript,
           transcriptOffset: snapshot.transcriptOffset,
           subtitleUrl: subtitle?.subtitle_url || "",
-          sourceMode: snapshot.subtitleIndex === "auto" ? "auto" : "subtitle",
+          sourceMode: subtitleIndex === "auto" ? "auto" : "subtitle",
         }),
       });
       if (!response.ok) {

@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server'
 import { biliMetadata } from '../../../lib/bili-metadata'
 import type { VideoLink } from '../../../lib/video-url'
 import { parseVideoLink, trustedAsset } from '../../../lib/video-url'
-import { biliJson, biliHeaders, requestJson, HttpError, errorResponse } from '../../../lib/upstream'
+import { biliJson, biliWbiJson, biliHeaders, requestJson, HttpError, errorResponse } from '../../../lib/upstream'
 
 export const maxDuration = 60
 
@@ -58,11 +58,17 @@ export async function POST(req: NextRequest) {
     let subtitles = []
     let subtitleNotice = ''
     try {
-      const player = await biliJson(`/x/player/v2?bvid=${v.bvid}&cid=${cid}`)
-      subtitles = (player.subtitle?.subtitles || []).flatMap((s: { lan: string; lan_doc: string; subtitle_url: string }) => {
+      let player
+      try { player = await biliJson(`/x/player/v2?bvid=${info.bvid}&cid=${cid}`) }
+      catch { player = await biliWbiJson('/x/player/wbi/v2', { bvid: info.bvid, cid }) }
+      const available = player?.subtitle?.subtitles || []
+      if (!Array.isArray(available)) throw new Error('平台字幕信息格式异常')
+      subtitles = available.flatMap((s: { lan: string; lan_doc: string; subtitle_url: string }) => {
+        if (!s || typeof s.lan !== 'string' || typeof s.lan_doc !== 'string' || typeof s.subtitle_url !== 'string') return []
         try { return [{ lan: s.lan, lan_doc: s.lan_doc, subtitle_url: trustedAsset(s.subtitle_url, 'subtitle').href }] } catch { return [] }
       })
-    } catch { subtitleNotice = '平台字幕暂不可用，可粘贴字幕文本或让 AI 服务尝试提取。' }
+      if (!subtitles.length) subtitleNotice = '当前访问条件下未取得平台字幕，可粘贴这一分 P 的实际字幕文本。'
+    } catch { subtitleNotice = '平台字幕查询暂不可用，可刷新来源重试，或粘贴这一分 P 的实际字幕文本。' }
     return Response.json({ ...info, subtitles, hasSubtitles: subtitles.length > 0, subtitleNotice })
   } catch (e) {
     if (resolvedLink?.platform === 'bilibili' && (!(e instanceof HttpError) || e.status >= 500)) return Response.json({ error: '云端暂时无法访问 B 站，正在尝试浏览器解析', browserFallback: true, resolvedUrl: resolvedLink.url }, { status: 502 })
