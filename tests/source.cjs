@@ -240,7 +240,10 @@ test("tutorial route sends only the chosen text window and its evidence to the m
   assert.equal(evidence.coverage, "partial");
   assert.equal(evidence.analyzedCharacters, 1000);
   assert.equal(evidence.cues[0].text, "乙".repeat(1000));
-  assert.ok(!sent.messages[1].content.includes("甲"));
+  const actualInput = sent.messages.at(-1).content;
+  assert.ok(!actualInput.includes("甲"));
+  assert.ok(actualInput.includes("乙".repeat(1000)));
+  assert.doesNotMatch(actualInput, /视频标题：/);
   assert.match(sent.messages[0].content, /source:编号/);
   assert.match(sent.messages[0].content, /步骤的排列序号不是原文 id/);
   assert.match(sent.messages[0].content, /每一条关键知识、每一个操作步骤都必须/);
@@ -367,6 +370,102 @@ test("automatic transcript timing reaches the evidence and model without guessin
   });
   const { events } = await routeEvents(post, {});
   assert.deepEqual(events.find(event => event.evidence).evidence.cues[0], { id: '1', text: '设置 price 的数值。', start: 53.58, end: 65.08 });
-  assert.match(sent.messages[1].content, /"start":53\.58/);
+  assert.match(sent.messages.at(-1).content, /"start":53\.58/);
   assert.ok(!events.some(event => event.error));
+});
+
+test("automatic connection and server failures use only the official alias without redirects", async () => {
+  for (const failure of [
+    new MockHttpError('视频 AI 服务连接超时或暂时不可用，请稍后重试'),
+    new MockHttpError('视频 AI 服务暂时无法访问（503），请稍后重试'),
+  ]) {
+    const requests = [];
+    const post = tutorialRoute({ requestJson: async (url, options) => {
+      requests.push({ url, options });
+      if (requests.length === 1) throw failure;
+      return { success: true, summary: '## 本节目的\n通过官方备用入口取得内容。' };
+    } });
+    const { events } = await routeEvents(post, {});
+    assert.deepEqual(requests.map(request => request.url), [
+      'https://api.bibigpt.co/api/v1/summarizeWithConfig',
+      'https://bibigpt.co/api/v1/summarizeWithConfig',
+    ]);
+    for (const { options } of requests) {
+      assert.equal(options.redirect, 'error');
+      assert.equal(options.headers.Authorization, 'Bearer test-token');
+      assert.equal(options.method, 'POST');
+    }
+    assert.equal(requests[0].options.body, requests[1].options.body);
+    assert.ok(events.some(event => event.text?.includes('官方备用入口')));
+    assert.ok(!events.some(event => event.error));
+  }
+});
+
+test("authentication, quota, rate limit, invalid output and successful responses never use the alias", async () => {
+  const failures = [400, 401, 402, 403, 429].map(status => new MockHttpError(`视频 AI 服务暂时无法访问（${status}），请稍后重试`));
+  failures.push(new MockHttpError('视频 AI 服务返回了验证页面，请稍后重试'), new Error('unexpected failure'));
+  for (const result of [...failures, { success: true, summary: '已有内容' }, { success: false }]) {
+    let requests = 0;
+    const post = tutorialRoute({ requestJson: async () => {
+      requests++;
+      if (result instanceof Error) throw result;
+      return result;
+    } });
+    await routeEvents(post, {});
+    assert.equal(requests, 1);
+  }
+});
+
+test("primary timeout and alias share one total extraction budget", async () => {
+  const timers = new Map(), combined = [], requests = [];
+  const post = tutorialRoute({
+    signals: {
+      timeout: milliseconds => {
+        assert.ok(!timers.has(milliseconds), 'a timeout budget must not be reset for the alias');
+        const controller = new AbortController();
+        timers.set(milliseconds, controller);
+        return controller.signal;
+      },
+      any: signals => { combined.push(signals); return AbortSignal.any(signals); },
+    },
+    requestJson: async (url, options) => {
+      requests.push(url);
+      if (requests.length === 1) {
+        assert.equal(options.signal.aborted, false);
+        timers.get(10000).abort();
+        assert.equal(options.signal.aborted, true);
+      } else {
+        assert.equal(options.signal.aborted, false, 'the expired primary timeout must not abort the alias');
+        timers.get(25000).abort();
+        assert.equal(options.signal.aborted, true, 'the alias must stop at the original total deadline');
+      }
+      throw new MockHttpError('视频 AI 服务连接超时或暂时不可用，请稍后重试');
+    },
+  });
+  const { events } = await routeEvents(post, {});
+  assert.deepEqual([...timers.keys()], [25000, 10000]);
+  assert.equal(requests.length, 2);
+  assert.ok(combined[0].includes(timers.get(25000).signal));
+  assert.ok(combined[1].includes(timers.get(25000).signal));
+  assert.ok(!combined[1].includes(timers.get(10000).signal));
+  assert.match(events.find(event => event.error).error, /响应超时/);
+});
+
+test("an exhausted total extraction budget never starts an alias request", async () => {
+  const budget = new AbortController();
+  let requests = 0;
+  const post = tutorialRoute({
+    signals: {
+      timeout: milliseconds => milliseconds === 25000 ? budget.signal : new AbortController().signal,
+      any: AbortSignal.any.bind(AbortSignal),
+    },
+    requestJson: async () => {
+      requests++;
+      budget.abort();
+      throw new MockHttpError('视频 AI 服务连接超时或暂时不可用，请稍后重试');
+    },
+  });
+  const { events } = await routeEvents(post, {});
+  assert.equal(requests, 1);
+  assert.match(events.find(event => event.error).error, /响应超时/);
 });
