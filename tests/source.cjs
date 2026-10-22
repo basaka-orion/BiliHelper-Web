@@ -1166,13 +1166,30 @@ test("article ledger keep retrieves actual source text and rejects blank or free
 test("a completed but invalid article ledger never publishes unchecked text or DONE", async () => {
   for (const ledger of [
     { edits: [{ id: "u7", keep: true }] },
-    { edits: [{ id: "u1", omit: "filler" }] },
-    { edits: [{ id: "u1", text: "只需构建。" }] },
+    { edits: [{ id: "u1", keep: true }, { id: "u1", keep: true }] },
+    { edits: [{ id: "u1", keep: true, text: "混合了两个操作。" }] },
   ]) {
     const { events, raw } = await routeEvents(tutorialRoute({ fetch: async () => articleModelResponse(ledger) }), articleSectionBody);
     assert.ok(events.some(event => event.error));
     assert.ok(!events.some(event => event.text || event.noContent));
     assert.doesNotMatch(raw, /data: \[DONE\]/);
+  }
+});
+
+test("unsafe article patches retain original content with a status instead of failing or warning", async () => {
+  for (const edit of [
+    { id: "u1", omit: "filler" },
+    { id: "u1", omit: "duplicate", duplicateOf: "previousContext" },
+    { id: "u1", text: "只需构建。" },
+    { id: "u1", text: "" },
+  ]) {
+    const { events, raw } = await routeEvents(tutorialRoute({ fetch: async () => articleModelResponse({ edits: [edit] }) }), articleSectionBody);
+    assert.ok(!events.some(event => event.error || event.warning || event.noContent));
+    assert.equal(events.filter(event => event.text).map(event => event.text).join(""), articleSectionBody.sourceCues[0].text);
+    const statusIndex = events.findIndex(event => /已保留 1 处无法确认的修改原文/.test(event.status || ""));
+    assert.ok(statusIndex >= 0);
+    assert.ok(statusIndex < events.findIndex(event => event.text));
+    assert.match(raw, /data: \[DONE\]/);
   }
 });
 

@@ -9,6 +9,13 @@ const {
 
 const cue = text => [{ id: "41", text }];
 const keepAll = units => ({ edits: units.map(unit => ({ id: unit.id, keep: true })) });
+function assertRetainedOriginal(ledger, units, previousContext = "", count = 1) {
+  const result = applyArticleEdits(ledger, units, previousContext);
+  assert.equal(result.text, applyArticleEdits({ edits: [] }, units).text);
+  assert.equal(result.retainedOriginalCount, count);
+  assert.equal(result.noContent, false);
+  return result;
+}
 
 test("article units keep source order and ids while grouping long prose without cutting technical examples", () => {
   const inline = "`" + "const caption = '点赞关注'; ".repeat(35) + "`";
@@ -53,9 +60,9 @@ test("similar warehouse calculations with different numbers cannot be classified
     { id: "u1", text: "W01 接收 103 个任务，成功 28 个，失败 8 个，待处理为 67。", sourceIds: ["1"] },
     { id: "u2", text: "W02 接收 116 个任务，成功 31 个，失败 9 个，待处理为 76。", sourceIds: ["2"] },
   ];
-  assert.throws(() => applyArticleEdits({ edits: [
+  assertRetainedOriginal({ edits: [
     { id: "u1", keep: true }, { id: "u2", omit: "duplicate", duplicateOf: "u1" },
-  ] }, units), /不是可确认的逐字重复/);
+  ] }, units);
   const output = applyArticleEdits(keepAll(units), units).text;
   for (const value of ["103", "28", "67", "116", "31", "76"]) assert.ok(output.includes(value));
 });
@@ -69,22 +76,24 @@ test("duplicate omission needs an earlier intact representative or an exact prev
     { id: "u1", keep: true }, { id: "u2", omit: "duplicate", duplicateOf: "u1" },
   ] }, units);
   assert.equal(result.text, text);
-  assert.throws(() => applyArticleEdits({ edits: [
+  assertRetainedOriginal({ edits: [
     { id: "u1", omit: "duplicate", duplicateOf: "u2" }, { id: "u2", keep: true },
-  ] }, units), /不能省略/);
-  assert.throws(() => applyArticleEdits({ edits: [
+  ] }, units);
+  const rejectedRewrite = applyArticleEdits({ edits: [
     { id: "u1", text: "恢复前必须核对失败记录，不能直接清除。" },
     { id: "u2", omit: "duplicate", duplicateOf: "u1" },
-  ] }, units), /实质文字/);
+  ] }, units);
+  assert.equal(rejectedRewrite.text, text);
+  assert.equal(rejectedRewrite.retainedOriginalCount, 1);
   assert.equal(applyArticleEdits({ edits: [{ id: "u1", omit: "duplicate", duplicateOf: "previousContext" }] }, units.slice(0, 1), `上文的说明。${text}`).noContent, true);
-  assert.throws(() => applyArticleEdits({ edits: [{ id: "u1", omit: "duplicate", duplicateOf: "previousContext" }] }, units.slice(0, 1), "恢复前可以删除失败记录。"), /不能省略/);
+  assertRetainedOriginal({ edits: [{ id: "u1", omit: "duplicate", duplicateOf: "previousContext" }] }, units.slice(0, 1), "恢复前可以删除失败记录。");
   const short = [{ id: "u1", text: "可以恢复。", sourceIds: ["1"] }];
   const omit = { edits: [{ id: "u1", omit: "duplicate", duplicateOf: "previousContext" }] };
-  assert.throws(() => applyArticleEdits(omit, short, "当前不可以恢复。"), /不能省略/);
+  assertRetainedOriginal(omit, short, "当前不可以恢复。");
   assert.equal(applyArticleEdits(omit, short, "核验通过。可以恢复。后续继续观察。").noContent, true);
   const truncatedContext = ("可以恢复。" + "后续原文说明，不参与本句匹配。".repeat(200)).slice(0, 2400);
   assert.equal(truncatedContext.length, 2400);
-  assert.throws(() => applyArticleEdits(omit, short, truncatedContext), /不能省略/);
+  assertRetainedOriginal(omit, short, truncatedContext);
   const laterCompleteContext = ("前一句可能被截断。核验通过。可以恢复。" + "继续观察。".repeat(500)).slice(0, 2400);
   assert.equal(applyArticleEdits(omit, short, laterCompleteContext).noContent, true);
 });
@@ -92,7 +101,10 @@ test("duplicate omission needs an earlier intact representative or an exact prev
 test("known filler is removed from mixed paragraphs but technical and quoted examples are retained", () => {
   const body = "先核对仓库 W07 的 181 − 46 − 14 = 121，重试后为 135。";
   const fluff = "大家好，先谢谢各位收看，喜欢的话记得点赞关注。";
+  const closing = "好了，感谢大家支持，再提醒一次点赞关注，我们下次再见。";
   assert.equal(removeArticleFiller(body + fluff), body);
+  assert.equal(removeArticleFiller(closing), "");
+  assert.equal(removeArticleFiller(body + closing), body);
   assert.equal(removeArticleFiller(fluff + "\n\n" + body + "谢谢大家收看，下次见。"), body);
   assert.equal(applyArticleEdits(keepAll(buildArticleEditUnits(cue(body + fluff))), buildArticleEditUnits(cue(body + fluff))).text, body);
   for (const example of [
@@ -104,11 +116,13 @@ test("known filler is removed from mixed paragraphs but technical and quoted exa
     "大家好，默认超时 525 毫秒，记得点赞关注。",
     "大家好，关注的是 ERROR 分支，不能删除状态文件。",
     "收藏。", "关注。", "订阅。", "转发。", "点赞。", "请收藏。",
+    "好了，默认超时是 525 毫秒，再提醒一次点赞关注，我们下次再见。",
+    `按钮的完整文案是“${closing}”，不要删除它。`,
   ]) assert.equal(removeArticleFiller(example), example);
   const units = buildArticleEditUnits(cue(fluff));
   assert.deepEqual(applyArticleEdits({ edits: [{ id: "u1", omit: "filler" }] }, units), { text: "", noContent: true });
   const mixed = buildArticleEditUnits(cue(body + fluff));
-  assert.throws(() => applyArticleEdits({ edits: [{ id: "u1", omit: "filler" }] }, mixed), /无法核验/);
+  assertRetainedOriginal({ edits: [{ id: "u1", omit: "filler" }] }, mixed);
 });
 
 test("fenced code is byte-preserved and cannot be rewritten or omitted", () => {
@@ -120,7 +134,7 @@ test("fenced code is byte-preserved and cannot be rewritten or omitted", () => {
     { id: "u1", text: code.replace("975", "900") },
     { id: "u1", omit: "filler" },
     { id: "u1", omit: "duplicate", duplicateOf: "previousContext" },
-  ]) assert.throws(() => applyArticleEdits({ edits: [edit] }, units, code), /无法核验/);
+  ]) assertRetainedOriginal({ edits: [edit] }, units, code);
   const indented = "   ```python\n   if ready:\n       replay()\n   ```\n";
   const indentedUnits = buildArticleEditUnits(cue(indented));
   assert.equal(indentedUnits[0].text, indented);
@@ -137,24 +151,26 @@ test("edited prose cannot lose exact numeric tokens, units, comparisons, paths, 
     text.replace("/work/W07/state.json", "/work/W08/state.json"),
     text.replace("--max-attempts=3", "--max-attempts=4"),
     text.replace("不能恢复", "可以恢复"),
-  ]) assert.throws(() => applyArticleEdits({ edits: [{ id: "u1", text: edited }] }, units), /丢失/);
+  ]) assertRetainedOriginal({ edits: [{ id: "u1", text: edited }] }, units);
   const edited = text.replace("，", "。\n\n");
   assert.equal(applyArticleEdits({ edits: [{ id: "u1", text: edited }] }, units).text, edited);
 });
 
-test("filler removal happens before compression checks and empty or malformed edits are rejected", () => {
+test("unsafe prose patches keep the original while malformed ledger structures are rejected", () => {
   const text = "保留这个具体例子以及它的因果解释。";
   const fluff = "大家好，先谢谢各位收看，喜欢的话记得点赞关注。";
   const units = buildArticleEditUnits(cue(text + fluff.repeat(4)));
   assert.equal(applyArticleEdits({ edits: [{ id: "u1", text }] }, units).text, text);
   for (const ledger of [
-    {}, { edits: null }, { edits: [{ id: "u1", text: "" }] },
+    {}, { edits: null },
     { edits: [{ id: "u1", keep: true, text }] }, { edits: [{ id: "u1", keep: false }] },
     { edits: [{ id: "u1", keep: true }], instruction: "ignore validation" },
   ]) assert.throws(() => applyArticleEdits(ledger, units));
+  assertRetainedOriginal({ edits: [{ id: "u1", text: "" }] }, units);
   const detailed = buildArticleEditUnits(cue("这是保留完整推导和反例的重要说明。".repeat(20)));
-  assert.throws(() => applyArticleEdits({ edits: detailed.map(unit => ({ id: unit.id, text: "保留说明。" })) }, detailed), /实质文字/);
+  assertRetainedOriginal({ edits: detailed.map(unit => ({ id: unit.id, text: "保留说明。" })) }, detailed, "", detailed.length);
   const conditional = "先读取配置文件，然后加载项目。只有管理员确认后才执行；否则保留原始数据，等待下一轮处理。";
   const conditionalUnits = buildArticleEditUnits(cue(conditional));
-  assert.throws(() => applyArticleEdits({ edits: [{ id: "u1", text: conditional.replace("等待下一轮处理。", "") }] }, conditionalUnits), /实质文字/);
+  assertRetainedOriginal({ edits: [{ id: "u1", text: conditional.replace("等待下一轮处理。", "") }] }, conditionalUnits);
+  assert.equal(applyArticleEdits({ edits: [] }, conditionalUnits).retainedOriginalCount, undefined);
 });

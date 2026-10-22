@@ -902,6 +902,8 @@ export async function POST(req: NextRequest) {
             try { ledger = JSON.parse(articleLedger); }
             catch { throw new Error("文稿编辑账本不是完整 JSON，尚未整理完整，请重试当前段。"); }
             const article = applyArticleEdits(ledger, articleUnits, previousContext || "");
+            if (article.retainedOriginalCount)
+              send({ status: `已保留 ${article.retainedOriginalCount} 处无法确认的修改原文，继续合并完整文稿。` });
             if (article.noContent) send({ noContent: true, status: "本段仅含寒暄、广告或纯重复，已略去。" });
             else send({ text: article.text });
           }

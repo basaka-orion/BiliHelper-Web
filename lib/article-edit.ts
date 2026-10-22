@@ -99,14 +99,15 @@ function pureFiller(text: string): boolean {
     .split(/[。！？!?；;，,、\n]+/).map((part) => part.trim()).filter(Boolean);
   if (!clauses.length) return false;
   return clauses.every((clause) => {
-    const value = clause.replace(/^(?:先|也|再次|最后|那么|那)(?=谢谢|感谢|请|记得|欢迎)/, "");
+    const value = clause.replace(/^(?:先|也|再次|最后|那么|那)(?=谢谢|感谢|请|记得|欢迎)/, "")
+      .replace(/^再提醒一次(?=点赞关注$)/, "");
     const promotionalContext = /喜欢|大家|各位|帮忙|帮我|给我|顺手|动动小手|一键三连|(?:点赞|点个赞|点一下赞).*(?:关注|订阅)|(?:关注|订阅).*点赞/.test(value);
     return /^(?:大家|各位|朋友们|同学们|观众朋友们|小伙伴们)好(?:啊|呀|哦)?$/.test(value) ||
       /^(?:谢谢|感谢)(?:大家|各位|你|您|你们)?(?:的)?(?:观看|收看|收听|支持|陪伴)$/.test(value) ||
       (promotionalContext && /^(?:如果)?(?:喜欢(?:这个视频|本期视频)?(?:的话)?)?(?:大家|各位)?(?:请|还请|记得|别忘了|欢迎|麻烦大家|希望大家)?(?:大家|各位)?(?:帮忙|帮我|给我|顺手|动动小手)?(?:点个赞|点一下赞|点赞|关注|订阅|转发|收藏|一键三连)(?:(?:并|和|再|及|加)?(?:点赞|关注|订阅|转发|收藏|一键三连))*(?:一下|哦|呀|吧|哟)?$/.test(value)) ||
-      /^(?:我们)?(?:下期再见|下次见|再见|拜拜)$/.test(value) ||
+      /^(?:我们)?(?:下期再见|下次见|下次再见|再见|拜拜)$/.test(value) ||
       /^(?:本期视频|今天|这期视频)(?:就)?到这里$/.test(value) ||
-      /^(?:嗯|啊|呃|额|哦|好的|那么|就是这样)+$/.test(value);
+      /^(?:嗯|啊|呃|额|哦|好的|好了|那么|就是这样)+$/.test(value);
   });
 }
 
@@ -233,7 +234,7 @@ export function applyArticleEdits(
   value: unknown,
   units: ArticleEditUnit[],
   previousContext = "",
-): { text: string; noContent: boolean } {
+): { text: string; noContent: boolean; retainedOriginalCount?: number } {
   if (!value || typeof value !== "object" || Array.isArray(value) ||
       Object.keys(value).some((key) => key !== "edits") ||
       !Array.isArray((value as { edits?: unknown }).edits))
@@ -254,24 +255,35 @@ export function applyArticleEdits(
   }
   const rendered: string[] = [];
   const kept = new Map<string, string>();
+  let retainedOriginalCount = 0;
   for (const unit of units) {
     const row = explicit.get(unit.id) || { id: unit.id, keep: true };
     const keys = Object.keys(row).filter((key) => key !== "id");
+    const original = () => unit.verbatim ? unit.text : removeArticleFiller(unit.text);
+    const retainOriginal = () => { retainedOriginalCount++; return original(); };
     let text = "";
     if (row.keep === true && keys.length === 1) {
-      text = unit.verbatim ? unit.text : removeArticleFiller(unit.text);
-    } else if (typeof row.text === "string" && row.text.length <= 60000 && keys.length === 1 && !unit.verbatim) {
-      assertEditedText(unit.text, row.text, unit.id);
-      text = removeArticleFiller(row.text);
-    } else if (row.omit === "filler" && keys.length === 1 && !unit.verbatim && !removeArticleFiller(unit.text)) {
-      text = "";
-    } else if (row.omit === "duplicate" && keys.length === 2 && typeof row.duplicateOf === "string" && !unit.verbatim) {
+      text = original();
+    } else if (typeof row.text === "string" && keys.length === 1) {
+      if (unit.verbatim || row.text.length > 60000) text = retainOriginal();
+      else {
+        try {
+          assertEditedText(unit.text, row.text, unit.id);
+          text = removeArticleFiller(row.text);
+        } catch {
+          // Reject an unsafe patch, not the intact source unit or the whole article.
+          text = retainOriginal();
+        }
+      }
+    } else if (row.omit === "filler" && keys.length === 1) {
+      text = !unit.verbatim && !removeArticleFiller(unit.text) ? "" : retainOriginal();
+    } else if (row.omit === "duplicate" && keys.length === 2 && typeof row.duplicateOf === "string") {
       const canonical = duplicateText(removeArticleFiller(unit.text));
       const prior = kept.get(row.duplicateOf);
       const contextDuplicate = row.duplicateOf === "previousContext" && canonical &&
         previousContextContainsUnit(previousContext, canonical);
-      if (!canonical || (!contextDuplicate && (!prior || duplicateText(prior) !== canonical)))
-        throw new Error(`文稿单元 ${unit.id} 不是可确认的逐字重复，不能省略，请重试。`);
+      if (unit.verbatim || !canonical || (!contextDuplicate && (!prior || duplicateText(prior) !== canonical)))
+        text = retainOriginal();
     } else {
       throw new Error(`文稿单元 ${unit.id} 的省略或编辑无法核验，尚未整理完整，请重试。`);
     }
@@ -282,5 +294,5 @@ export function applyArticleEdits(
     }
   }
   const text = rendered.join("\n\n");
-  return { text, noContent: !text.trim() };
+  return { text, noContent: !text.trim(), ...(retainedOriginalCount ? { retainedOriginalCount } : {}) };
 }
