@@ -120,16 +120,66 @@ test('browser subtitle refresh propagates platform and cancellation failures ins
 class MetadataHttpError extends Error {
   constructor(message, status = 502) { super(message); this.status = status }
 }
-function metadataRoute(biliJson, biliWbiJson) {
+function metadataRoute(biliJson, biliWbiJson, fetchImpl) {
   return loadTypeScript('app/api/video-info/route.ts', {
     '../../../lib/upstream': { biliJson, biliWbiJson, biliHeaders: {}, HttpError: MetadataHttpError,
       errorResponse: error => Response.json({ error: error.message }, { status: error.status || 500 }),
       requestJson: async () => { throw new Error('Unexpected request') } },
-  })
+  }, fetchImpl ? { fetch: fetchImpl } : {})
 }
 const metadataVideo = { bvid: 'BV1wD4y1o7AS', title: 'Course', cid: 111, duration: 100,
   owner: { name: 'Teacher' }, pages: [{ page: 1, cid: 111, part: 'Intro', duration: 100 }, { page: 2, cid: 222, part: 'Install', duration: 200 }] }
 const metadataRequest = () => new Request('https://example.test/api/video-info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: 'https://www.bilibili.com/video/BV1wD4y1o7AS?p=2' }) })
+
+test('an unexpanded short link fails clearly without querying metadata for an undefined video', async () => {
+  const calls = []
+  let metadataCalls = 0
+  const route = metadataRoute(async () => {
+    metadataCalls++
+    throw new Error('An unresolved short link cannot request metadata')
+  }, async () => { throw new Error('Unexpected player request') }, async (url, options) => {
+    calls.push(url)
+    assert.equal(options.redirect, 'manual')
+    return new Response('Bilibili access challenge', { status: 200 })
+  })
+  const response = await route.POST(new Request('https://example.test/api/video-info', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: 'https://b23.tv/t9j1lcK' }),
+  })), data = await response.json()
+  assert.equal(response.status, 502)
+  assert.match(data.error, /短链接未能展开.*完整链接/)
+  assert.doesNotMatch(data.error, /正在尝试/)
+  assert.equal(data.browserFallback, undefined)
+  assert.equal(data.resolvedUrl, undefined)
+  assert.equal(metadataCalls, 0)
+  assert.deepEqual(calls, ['https://b23.tv/t9j1lcK'])
+})
+
+test('a resolved short link retains its canonical selected part when cloud metadata needs browser recovery', async () => {
+  const calls = []
+  const canonical = 'https://www.bilibili.com/video/BV1wD4y1o7AS?p=2'
+  const route = metadataRoute(async (endpoint) => {
+    assert.equal(endpoint, '/x/web-interface/view?bvid=BV1wD4y1o7AS')
+    throw new MetadataHttpError('Cloud API denied')
+  }, async () => { throw new Error('Unexpected player request') }, async (url, options) => {
+    calls.push(url)
+    if (url === 'https://b23.tv/t9j1lcK') {
+      assert.equal(options.redirect, 'manual')
+      return new Response(null, { status: 302, headers: { location: `${canonical}&spm_id_from=share` } })
+    }
+    assert.equal(url, canonical)
+    return new Response('Cloud page denied', { status: 503 })
+  })
+  const response = await route.POST(new Request('https://example.test/api/video-info', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: 'https://b23.tv/t9j1lcK' }),
+  })), data = await response.json()
+  assert.equal(response.status, 502)
+  assert.equal(data.browserFallback, true)
+  assert.equal(data.resolvedUrl, canonical)
+  assert.doesNotMatch(data.error, /正在尝试/)
+  assert.deepEqual(calls, ['https://b23.tv/t9j1lcK', canonical])
+})
 
 test('metadata route tries the signed official player endpoint with the selected part after v2 fails', async () => {
   const calls = []

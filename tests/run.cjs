@@ -9,6 +9,7 @@ try {
     [
       "node_modules/typescript/bin/tsc",
       "lib/video-url.ts",
+      "lib/video-import.ts",
       "lib/sse.ts",
       "lib/bili-metadata.ts",
       "lib/markdown.ts",
@@ -37,6 +38,7 @@ try {
       [
         "--test",
         "tests/core.cjs",
+        "tests/video-import.cjs",
         "tests/source.cjs",
         "tests/workspace.cjs",
         "tests/refresh.cjs",
