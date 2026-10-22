@@ -376,7 +376,7 @@ export function buildFullEvidence(
     totalCharacters: total,
     analyzedCharacters: total,
     limitation:
-      "已整理当前所提供的全部字幕；字幕是否覆盖整段视频仍取决于来源，且未核验视频画面。",
+      "当前来源包含所提供的全部字幕；字幕是否覆盖整段视频仍取决于来源，且未核验视频画面。",
     cues,
   };
 }

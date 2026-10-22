@@ -86,6 +86,8 @@ function transcriptToCues(value: string): SourceCue[] {
 
 function transcriptionFailure(error: unknown, timedOut: boolean): string {
   if (timedOut) return "音频转写超时。";
+  if (error instanceof HttpError && /^本节音频(?:身份核验|播放信息)/.test(error.message))
+    return error.message;
   const status = upstreamFailureStatus(error);
   if (Number.isFinite(status)) {
     if (status === 401)
@@ -101,6 +103,16 @@ function transcriptionFailure(error: unknown, timedOut: boolean): string {
   return "音频下载或转写暂时失败，可粘贴这一节的实际字幕后重试。";
 }
 
+function audioStageFailure(stage: "身份核验" | "播放信息", error: unknown): HttpError {
+  const status = upstreamFailureStatus(error);
+  const detail = Number.isFinite(status)
+    ? `读取失败（${status}）`
+    : error instanceof HttpError && error.message.includes("限制了访问")
+      ? "被平台限制"
+      : "暂时无法读取";
+  return new HttpError(`本节音频${stage}${detail}。请稍后重试，或粘贴这一节的实际字幕。`);
+}
+
 /** Download only the selected part's audio and transcribe it with SiliconFlow ASR. */
 async function requestAudioTranscript(
   bvid: string,
@@ -112,12 +124,30 @@ async function requestAudioTranscript(
 ): Promise<SourceCue[]> {
   if (signal.aborted || budget.aborted) throw new HttpError("音频转写已停止");
   // A client-provided cid is a hint, never proof that audio belongs to this URL/P.
-  const video = await biliJson(`/x/web-interface/view?bvid=${bvid}`);
-  let metadata;
+  let metadata: { bvid: string; cid: number; duration: number };
   try {
+    const video = await biliJson(`/x/web-interface/view?bvid=${bvid}`);
     metadata = biliMetadata(video, page);
-  } catch {
-    throw new HttpError("无法核对当前分 P 的音频，请刷新视频来源后重试。");
+  } catch (error) {
+    logSourceFailure("audio-metadata-view", error, false, bvid);
+    if (signal.aborted || budget.aborted) throw error;
+    if (error instanceof HttpError && error.status === 404) throw audioStageFailure("身份核验", error);
+    // The official pagelist is an independent metadata endpoint, not a client hint.
+    // It supplies exactly the part id and duration needed for safe audio fallback.
+    let pages;
+    try {
+      pages = await biliJson(`/x/player/pagelist?bvid=${bvid}`);
+    } catch (fallbackError) {
+      logSourceFailure("audio-metadata-pagelist", fallbackError, false, bvid);
+      throw audioStageFailure("身份核验", fallbackError);
+    }
+    const matches = Array.isArray(pages)
+      ? pages.filter((part) => part && part.page === page) : [];
+    const part = matches[0];
+    if (matches.length !== 1 || !Number.isSafeInteger(part?.cid) || part.cid < 1 ||
+        typeof part.duration !== "number" || !Number.isFinite(part.duration) || part.duration <= 0)
+      throw new HttpError("无法核对当前分 P 的音频，请刷新视频来源后重试。");
+    metadata = { bvid, cid: part.cid, duration: part.duration };
   }
   if (metadata.bvid !== bvid || metadata.cid !== cid)
     throw new HttpError("音频标识与当前分 P 不一致，请刷新视频来源后重试。");
@@ -137,10 +167,17 @@ async function requestAudioTranscript(
       platform: "pc",
       qn: 64,
     });
-  } catch {
-    play = await biliJson(
-      `/x/player/playurl?bvid=${bvid}&cid=${cid}&fnval=16&fnver=0&fourk=1&platform=pc&qn=64`,
-    );
+  } catch (error) {
+    logSourceFailure("audio-playurl-signed", error, false, bvid);
+    if (signal.aborted || budget.aborted) throw error;
+    try {
+      play = await biliJson(
+        `/x/player/playurl?bvid=${bvid}&cid=${cid}&fnval=16&fnver=0&fourk=1&platform=pc&qn=64`,
+      );
+    } catch (fallbackError) {
+      logSourceFailure("audio-playurl-plain", fallbackError, false, bvid);
+      throw audioStageFailure("播放信息", fallbackError);
+    }
   }
   const candidates: { url: URL; bandwidth: number }[] = [];
   for (const audio of Array.isArray(play?.dash?.audio) ? play.dash!.audio! : []) {
@@ -316,7 +353,8 @@ async function requestAutomaticTranscript(
 }
 
 function logSourceFailure(
-  stage: "platform" | "automatic" | "automatic-primary" | "automatic-audio",
+  stage: "platform" | "automatic" | "automatic-primary" | "automatic-audio" |
+    "audio-metadata-view" | "audio-metadata-pagelist" | "audio-playurl-signed" | "audio-playurl-plain",
   error: unknown,
   timedOut: boolean,
   videoId: string,

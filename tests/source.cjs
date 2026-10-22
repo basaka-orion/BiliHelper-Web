@@ -1132,3 +1132,73 @@ test("audio fallback refuses a partial HTTP response instead of transcribing a f
   assert.match(events.find(event => event.error).error, /音频下载不完整/);
   assert.equal(asr, 0);
 });
+
+test("audio identity verification can use the official pagelist after the view endpoint fails", async () => {
+  const reads = [], logs = [];
+  const post = tutorialRoute({
+    logs,
+    biliJson: async path => {
+      reads.push(path);
+      if (path.startsWith("/x/web-interface/view"))
+        throw new MockHttpError("B 站暂时无法访问（412），请稍后重试。");
+      if (path.startsWith("/x/player/pagelist"))
+        return [
+          { page: 1, cid: 11, duration: 100 },
+          { page: 2, cid: 42, duration: 453 },
+        ];
+      throw new Error("Unexpected plain API");
+    },
+    biliWbiJson: async (_path, parameters) => {
+      assert.equal(parameters.cid, 42);
+      return audioPlay;
+    },
+    fetch: async () => new Response(new Uint8Array(8), { headers: { "Content-Type": "audio/mp4", "Content-Length": "8" } }),
+    requestJson: async () => ({ text: "官方分 P 信息核验后的真实音频转写文字。" }),
+  });
+  const { events } = await routeEvents(post, audioPartBody);
+  assert.deepEqual(reads, ["/x/web-interface/view?bvid=BV1wD4y1o7AS", "/x/player/pagelist?bvid=BV1wD4y1o7AS"]);
+  assert.ok(events.some(event => event.transcript?.cues?.[0]?.text.includes("真实音频")));
+  assert.ok(!events.some(event => event.error));
+  assert.ok(logs.some(([, detail]) => detail.stage === "audio-metadata-view" && detail.httpStatus === 412));
+});
+
+test("pagelist fallback still rejects a wrong cid, absent part or over-hour duration before audio fetch", async () => {
+  for (const pages of [
+    [{ page: 2, cid: 99, duration: 120 }],
+    [{ page: 1, cid: 42, duration: 120 }],
+    [{ page: 2, cid: 42, duration: 3601 }],
+  ]) {
+    let downstream = 0;
+    const post = tutorialRoute({
+      biliJson: async path => {
+        if (path.startsWith("/x/web-interface/view")) throw new MockHttpError("B 站暂时无法访问（412），请稍后重试。");
+        return pages;
+      },
+      biliWbiJson: async () => { downstream++; return audioPlay; },
+      fetch: async () => { downstream++; return new Response("bad"); },
+    });
+    const { events } = await routeEvents(post, audioPartBody);
+    assert.match(events.find(event => event.error).error, /不一致|无法核对|60 分钟/);
+    assert.equal(downstream, 0);
+  }
+});
+
+test("metadata and playurl failures are identified as platform audio stages, not ASR failures", async () => {
+  for (const stage of ["metadata", "playurl"]) {
+    const logs = [];
+    const post = tutorialRoute({
+      logs,
+      biliJson: async path => {
+        if (stage === "playurl" && path.startsWith("/x/web-interface/view")) return audioMetadata(42, 2);
+        throw new MockHttpError("B 站暂时无法访问（412），请稍后重试。");
+      },
+      biliWbiJson: async () => { throw new MockHttpError("B 站暂时无法访问（412），请稍后重试。"); },
+    });
+    const { events } = await routeEvents(post, audioPartBody);
+    const error = events.find(event => event.error).error;
+    assert.match(error, stage === "metadata" ? /身份核验读取失败（412）/ : /播放信息读取失败（412）/);
+    assert.doesNotMatch(error, /音频转写服务访问失败/);
+    assert.ok(logs.some(([, detail]) => detail.stage === (stage === "metadata" ? "audio-metadata-pagelist" : "audio-playurl-plain") && detail.httpStatus === 412));
+    assert.doesNotMatch(JSON.stringify(logs), /test-token|Authorization/);
+  }
+});
