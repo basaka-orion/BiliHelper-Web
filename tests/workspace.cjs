@@ -73,6 +73,7 @@ test("workspace identities normalize tracking and distinguish course parts", () 
   assert.equal(document.video.selectedPage, 2);
   assert.equal(document.transcriptOffset, 0);
   assert.equal(document.generationState, "idle");
+  assert.equal(document.noteMode, "article");
 });
 
 test("complete note, previous version, draft, source evidence and user work survive a reload", () => {
@@ -322,6 +323,7 @@ test("full document mode, completed sections and resume state survive a reload",
   assert.equal(saved.noteMode, "full");
   assert.equal(saved.generationState, "interrupted");
   assert.equal(saved.fullJob.status, "paused");
+  assert.equal(saved.fullJob.mode, "full");
   assert.equal(saved.fullJob.totalSections, 2);
   assert.equal(saved.fullJob.sections.length, 1);
   assert.equal(saved.fullJob.sections[0].cueIds[0], "1");
@@ -462,4 +464,77 @@ test("an oversized legacy source preserves draft evidence without renumbering it
   assert.equal(restored.draft.text, document.draft.text);
   assert.equal(restored.draft.evidence.cues[0].text.length, 6000);
   assert.match(restored.draft.error, /重新读取原文/);
+});
+
+test("article selection, completed note, previous mode and resumable progress survive saving and refresh", () => {
+  const document = createDocument(video(1));
+  const cues = [1, 2, 3].map(id => ({ id: String(id), text: "真实内容".repeat(875) }));
+  document.noteMode = "article";
+  document.note = { ...note("# 一篇完整文章\n\n完整的自然正文。"), mode: "article", sectionCount: 3 };
+  document.previousNote = { ...note("## 已有全文整理\n\n已有笔记。"), mode: "full" };
+  document.draft = { ...note("# 一篇完整文章\n\n尚未完成的正文。"), mode: "article", status: "partial", sectionCount: 2 };
+  document.fullJob = { ...resumableJob(cues, [
+    { index: 0, markdown: "第一段正文。", cueIds: ["1"] },
+    { index: 1, markdown: "第二段正文。", cueIds: ["2"] },
+  ], 3), mode: "article", status: "running" };
+  const restored = readWorkspace(serializeWorkspace(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.noteMode, "article");
+  assert.equal(restored.note.mode, "article");
+  assert.equal(restored.note.text, document.note.text);
+  assert.equal(restored.previousNote.mode, "full");
+  assert.equal(restored.draft.mode, "article");
+  assert.equal(restored.fullJob.mode, "article");
+  assert.equal(restored.fullJob.status, "paused");
+  assert.equal(restored.fullJob.sections.length, 2);
+  assert.deepEqual(restored.fullJob.sections.map(row => row.cueIds), [["1"], ["2"]]);
+});
+
+test("changing the selected mode does not relabel an existing full job or its draft as an article", () => {
+  const document = createDocument(video(1));
+  const cues = [{ id: "1", text: "已有全文整理原文" }];
+  document.noteMode = "article";
+  document.fullJob = resumableJob(cues, [{ index: 0, markdown: "## 既有整理\n\n内容。", cueIds: ["1"] }], 1);
+  document.draft = { ...note("## 既有整理\n\n内容。"), mode: "full", status: "partial" };
+  const restored = readWorkspace(serializeWorkspace(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.noteMode, "article");
+  assert.equal(restored.fullJob.mode, "full");
+  assert.equal(restored.draft.mode, "full");
+  assert.equal(restored.fullJob.sections[0].markdown, document.fullJob.sections[0].markdown);
+});
+
+test("article resume preserves explicitly omitted source ranges with their ids, and still rejects truncated or mismatched ranges", () => {
+  const document = createDocument(video(1));
+  const cues = [1, 2, 3, 4].map(id => ({ id: String(id), text: "字".repeat(3500) }));
+  document.fullJob = { ...resumableJob(cues, [
+    { index: 0, markdown: "", cueIds: ["1"], omitted: true },
+    { index: 1, markdown: "正文。", cueIds: ["2"] },
+    { index: 2, markdown: "", cueIds: ["3"], omitted: true },
+  ], 4), mode: "article" };
+  let restored = readWorkspace(serializeWorkspace(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.fullJob.mode, "article");
+  assert.equal(restored.fullJob.sections.length, 3);
+  assert.deepEqual(restored.fullJob.sections[0], document.fullJob.sections[0]);
+  assert.deepEqual(restored.fullJob.sections[2], document.fullJob.sections[2]);
+  document.fullJob.sections.push({ index: 3, markdown: "尚未完成", warning: "长度截断", cueIds: ["4"] });
+  assert.throws(() => serializeWorkspace(workspaceWith(document)), /进度超出本机保存范围/);
+  restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.fullJob.sections.length, 3);
+  assert.match(restored.fullJob.error, /第 4 段重新整理/);
+  document.fullJob.sections[0].cueIds = ["2"];
+  restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.fullJob.sections.length, 0);
+  assert.match(restored.fullJob.error, /第 1 段继续整理/);
+});
+
+test("only article jobs can persist empty advertising ranges; unmarked empty content cannot count as completed", () => {
+  const document = createDocument(video(1));
+  const cues = [{ id: "1", text: "广告内容" }];
+  document.fullJob = { ...resumableJob(cues, [{ index: 0, markdown: "", cueIds: ["1"], omitted: true }], 1), mode: "full" };
+  assert.throws(() => serializeWorkspace(workspaceWith(document)), /进度超出本机保存范围/);
+  document.fullJob.mode = "article";
+  delete document.fullJob.sections[0].omitted;
+  assert.throws(() => serializeWorkspace(workspaceWith(document)), /进度超出本机保存范围/);
+  const restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.fullJob.sections.length, 0);
+  assert.equal(restored.fullJob.mode, "article");
 });

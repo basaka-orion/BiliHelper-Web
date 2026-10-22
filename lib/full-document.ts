@@ -5,6 +5,7 @@ export interface FullDocumentSection {
   markdown: string;
   cueIds: string[];
   warning?: string;
+  omitted?: true;
 }
 
 export interface FullDocumentInput {
@@ -62,6 +63,11 @@ function tocFor(sections: FullDocumentSection[]): string {
   return lines.join("\n");
 }
 
+function assertContinuousSections(sections: FullDocumentSection[]): void {
+  if (sections.some((section, index) => section.index !== index || !!section.warning))
+    throw new Error("文档包含缺失或未完整输出的段落，请继续整理后再合并。");
+}
+
 export function assembleFullDocument(input: FullDocumentInput): string {
   const sections = input.sections
     .slice()
@@ -69,8 +75,7 @@ export function assembleFullDocument(input: FullDocumentInput): string {
     .map((section) => ({ ...section, markdown: cleanSection(section.markdown) }))
     .filter((section) => section.markdown);
   if (!sections.length) throw new Error("还没有可合并的文档段落。");
-  if (!input.partial && sections.some((section, index) => section.index !== index || !!section.warning))
-    throw new Error("文档包含缺失或未完整输出的段落，请继续整理后再合并。");
+  if (!input.partial) assertContinuousSections(sections);
   const title = (input.partTitle?.trim() || input.title.trim() || "视频完整文档")
     .replace(/\s+/g, " ");
   const date =
@@ -104,6 +109,78 @@ export function assemblePartialDocument(
   input: Omit<FullDocumentInput, "partial">,
 ): string {
   return assembleFullDocument({ ...input, partial: true });
+}
+
+/** Remove accidental citation decoration without touching code or link labels that are prose. */
+function articleSection(markdown: string, title: string): string {
+  let fence: { marker: string; length: number } | undefined;
+  let inlineTicks = 0;
+  const trimBlankLines = (value: string) => value.replace(/^(?:[ \t]*\r?\n)+/, "")
+    .replace(/(?:\r?\n[ \t]*)+$/, "");
+  const lines = trimBlankLines(tutorialMarkdown(markdown.replace(/^\uFEFF/, ""))).split("\n");
+  const cleaned = lines.map((line) => {
+    const boundary = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (boundary && boundary[1][0] === fence.marker &&
+          boundary[1].length >= fence.length && !boundary[2].trim()) fence = undefined;
+      return line;
+    }
+    if (boundary && !inlineTicks) {
+      fence = { marker: boundary[1][0], length: boundary[1].length };
+      return line;
+    }
+    if (/^(?: {4}|\t)/.test(line)) return line;
+    if (!inlineTicks) {
+      const heading = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+      if (heading && heading[2].trim() === title) return "";
+      if (heading?.[1] === "#") line = `#${line}`;
+    }
+    // Inline code can cross a line and can use a run of several backticks.
+    let output = "", position = 0;
+    const tokens = /`+|\[([^\]\n]+)\]\(source:[1-9]\d{0,5}\)/g;
+    for (const match of Array.from(line.matchAll(tokens))) {
+      output += line.slice(position, match.index);
+      if (match[0][0] === "`") {
+        if (!inlineTicks) inlineTicks = match[0].length;
+        else if (inlineTicks === match[0].length) inlineTicks = 0;
+        output += match[0];
+      } else if (inlineTicks) output += match[0];
+      else {
+        const label = match[1].trim();
+        output += /^(?:查看原文|查看来源|回看|回看原文|原文|来源|source)(?:\s*\d+)?$/i.test(label)
+          ? "" : match[1];
+      }
+      position = (match.index || 0) + match[0].length;
+    }
+    return output + line.slice(position);
+  });
+  // Section separators belong to the processing job, not to the article's prose.
+  return trimBlankLines(trimBlankLines(cleaned.join("\n")).replace(/^ {0,3}---+[ \t]*\r?\n/, "")
+    .replace(/\n {0,3}---+[ \t]*$/, ""));
+}
+
+/** Join already-written article sections directly; never summarize them a second time. */
+export function assembleArticle(input: FullDocumentInput): string {
+  const sections = input.sections.slice().sort((a, b) => a.index - b.index);
+  if (!sections.length) throw new Error("还没有可合并的文稿段落。");
+  // Check every acquired range before omitting advertising-only sections.
+  if (!input.partial) assertContinuousSections(sections);
+  if (sections.some((section) => section.omitted ? !!section.markdown.trim() : !section.markdown.trim()))
+    throw new Error("文稿包含缺失或未完整输出的段落，请继续整理后再合并。");
+  const title = (input.partTitle?.trim() || input.title.trim() || "视频完整文稿")
+    .replace(/\s+/g, " ");
+  const body = sections.filter((section) => !section.omitted)
+    .map((section) => articleSection(section.markdown, title)).filter(Boolean)
+    .join("\n\n");
+  if (!body) throw new Error("原文只有寒暄/广告/重复，没有可生成的文稿正文");
+  const status = input.partial ? "\n\n> 文稿尚未整理完成，以上是已经完成的部分。" : "";
+  return `# ${title}\n\n${body}${status}\n`;
+}
+
+export function assemblePartialArticle(
+  input: Omit<FullDocumentInput, "partial">,
+): string {
+  return assembleArticle({ ...input, partial: true });
 }
 
 /** Stable human-readable name for a downloaded Markdown file. */

@@ -38,11 +38,12 @@ export interface LearningNote {
   status: "complete" | "partial";
   error?: string;
   generatedAt: number;
-  mode?: "study" | "full";
+  mode?: "study" | "full" | "article";
   sectionCount?: number;
 }
 
 export interface FullDocumentJob {
+  mode?: "full" | "article";
   status: "running" | "paused" | "error";
   source: SourceEvidence;
   totalCharacters: number;
@@ -63,7 +64,7 @@ export interface LearningDocument {
   note?: LearningNote;
   previousNote?: LearningNote;
   draft?: LearningNote;
-  noteMode: "study" | "full";
+  noteMode: "study" | "full" | "article";
   fullJob?: FullDocumentJob;
   generationState: "idle" | "running" | "interrupted";
   scrollY: number;
@@ -263,7 +264,8 @@ function readNote(value: unknown): LearningNote | undefined {
     error = text(value.error, 10000);
   if (evidence) note.evidence = evidence;
   if (error !== undefined) note.error = error;
-  if (value.mode === "full" || value.mode === "study") note.mode = value.mode;
+  if (value.mode === "full" || value.mode === "study" || value.mode === "article")
+    note.mode = value.mode;
   if (
     validNumber(value.sectionCount) &&
     Number.isInteger(value.sectionCount) &&
@@ -276,6 +278,7 @@ function readNote(value: unknown): LearningNote | undefined {
 
 function readFullJob(value: unknown, recover: boolean): FullDocumentJob | undefined {
   if (!isRecord(value)) return;
+  const mode = value.mode === "article" ? "article" : "full";
   const source = readEvidence(value.source);
   if (!source || source.coverage !== "full") return;
   if (
@@ -316,6 +319,10 @@ function readFullJob(value: unknown, recover: boolean): FullDocumentJob | undefi
       markdown: row.markdown as string,
       cueIds,
     };
+    if (row.omitted === true) {
+      if (mode !== "article" || section.markdown.trim()) return;
+      section.omitted = true;
+    }
     const warning = text(row.warning, 2000);
     if (warning !== undefined) section.warning = warning;
     sections.push(section);
@@ -334,7 +341,7 @@ function readFullJob(value: unknown, recover: boolean): FullDocumentJob | undefi
     const ids = chunks[index]?.map((cue) => cue.id);
     return (
       section.index !== index ||
-      !section.markdown.trim() ||
+      (!section.markdown.trim() && !section.omitted) ||
       !!section.warning ||
       !ids ||
       section.cueIds.length !== ids.length ||
@@ -356,6 +363,7 @@ function readFullJob(value: unknown, recover: boolean): FullDocumentJob | undefi
   const startedAt = validNumber(value.startedAt) ? value.startedAt : Date.now();
   const updatedAt = validNumber(value.updatedAt) ? value.updatedAt : startedAt;
   const job: FullDocumentJob = {
+    mode,
     status:
       recoveryReason ? "error" : recover && value.status === "running"
         ? "paused"
@@ -384,7 +392,7 @@ export function createDocument(video: VideoInfo): LearningDocument {
     transcriptOffset: 0,
     subtitleIndex: "auto",
     memo: "",
-    noteMode: "full",
+    noteMode: "article",
     generationState: "idle",
     scrollY: 0,
     updatedAt: Date.now(),
@@ -414,7 +422,9 @@ function readDocument(
       : 0;
   document.scrollY = validNumber(value.scrollY) ? value.scrollY : 0;
   document.updatedAt = validNumber(value.updatedAt) ? value.updatedAt : 0;
-  document.noteMode = value.noteMode === "study" ? "study" : "full";
+  // Older saved documents keep the writing mode they used before article mode existed.
+  document.noteMode = value.noteMode === "article" || value.noteMode === "study"
+    ? value.noteMode : "full";
   document.generationState = ["running", "interrupted"].includes(
     value.generationState as string,
   )
