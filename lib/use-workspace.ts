@@ -95,7 +95,7 @@ export function useWorkspace() {
         event.key !== STORAGE_KEY ||
         dirty.current ||
         Object.values(current.current.documents).some(
-          (document) => document.generationState === "running",
+          (document) => document.generationState === "running" || document.mindmap?.status === "running",
         )
       )
         return;

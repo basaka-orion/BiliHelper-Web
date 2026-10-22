@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import dynamic from "next/dynamic";
 import remarkGfm from "remark-gfm";
 import {
   ArrowDownToLine,
@@ -14,6 +15,7 @@ import {
   Library,
   Link2,
   List,
+  Network,
   Loader2,
   Plus,
   Search,
@@ -28,13 +30,18 @@ import { refreshVideoSource } from "../lib/refresh-video-source";
 import { parseVideoLink } from "../lib/video-url";
 import { readSSE } from "../lib/sse";
 import { tutorialMarkdown } from "../lib/markdown";
+import { articleMarkdown } from "../lib/article-export";
+import { buildMindMapSection, buildMindMapUnits } from "../lib/mindmap";
+import { mindMapRoot } from "../lib/mindmap-view";
 import {
   createDocument,
   documentId,
   migrateHistory,
+  readMindMapSection,
   type LearningDocument,
   type LearningNote,
   type VideoInfo,
+  type MindMapDocument,
 } from "../lib/workspace";
 import { useWorkspace } from "../lib/use-workspace";
 import {
@@ -58,6 +65,10 @@ import {
 } from "../lib/full-document";
 import { Modal } from "./components/modal";
 import { DownloadPanel } from "./components/download-panel";
+const MindMap = dynamic(() => import("./components/mind-map").then((module) => module.MindMap), {
+  ssr: false,
+  loading: () => <p className="preparing">正在载入思维导图…</p>,
+});
 
 const EXAMPLE = "https://www.bilibili.com/video/BV1wD4y1o7AS";
 function duration(seconds = 0) {
@@ -158,6 +169,7 @@ export default function Home() {
   const [selectedCue, setSelectedCue] = useState("");
   const [sourceSearch, setSourceSearch] = useState("");
   const [showPrevious, setShowPrevious] = useState(false);
+  const [resultView, setResultView] = useState<"text" | "mindmap">("text");
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState("");
   const [deleted, setDeleted] = useState<LearningDocument>();
@@ -170,7 +182,7 @@ export default function Home() {
   const jobRef = useRef<{
     id: string;
     controller: AbortController;
-    mode?: "study" | "full" | "article";
+    mode?: "study" | "full" | "article" | "mindmap";
   } | null>(null);
   const analyzeRef = useRef<AbortController>();
   const contentRef = useRef<HTMLElement>(null);
@@ -222,7 +234,15 @@ export default function Home() {
       : currentEvidence?.kind !== "manual"
         ? currentEvidence?.totalCharacters || 0
         : 0);
-  const sourceEvidence = shownNote?.evidence || active?.fullJob?.source || active?.draft?.evidence;
+  const sourceEvidence = (resultView === "mindmap" ? active?.mindmap?.source : undefined) || shownNote?.evidence || active?.fullJob?.source || active?.draft?.evidence;
+  const mapRoot = useMemo(() => {
+    const map = active?.mindmap;
+    if (!map) return undefined;
+    const nodes = chunkSourceCues(map.source.cues).flatMap((chunk, index) =>
+      (map.sections[index] || buildMindMapSection(undefined, buildMindMapUnits(chunk), index + 1)).nodes,
+    );
+    return mindMapRoot(map.title, nodes, map.source.cues);
+  }, [active?.mindmap]);
   const sourceCues = sourceEvidence?.cues || [];
   const matchingCues = sourceCues.filter(
     (cue) => !sourceSearch || cue.text.includes(sourceSearch),
@@ -247,6 +267,7 @@ export default function Home() {
       restoreScroll.current = false;
     }, 50);
     setShowPrevious(false);
+    setResultView("text");
     setSelectedCue("");
     setFilter("");
     return () => clearTimeout(timeout);
@@ -621,6 +642,93 @@ export default function Home() {
     return { text: output, warning, omitted };
   }
 
+  async function prepareMindMap(
+    snapshot: LearningDocument,
+    source: SourceEvidence,
+    controller: AbortController,
+    resume = true,
+  ): Promise<boolean> {
+    const id = snapshot.id;
+    const chunks = chunkSourceCues(source.cues);
+    const saved = current.current.documents[id]?.mindmap;
+    const sameSource = saved?.source.kind === source.kind && saved.source.label === source.label &&
+      saved.source.cues.length === source.cues.length && saved.source.cues.every((cue, index) =>
+        cue.id === source.cues[index].id && cue.text === source.cues[index].text &&
+        cue.start === source.cues[index].start && cue.end === source.cues[index].end);
+    if (resume && sameSource && saved.status === "complete") return true;
+    let sections: MindMapDocument["sections"] = resume && sameSource ? [...saved.sections] : [];
+    const generatedAt = resume && sameSource ? saved.generatedAt : Date.now();
+    const change = (patch: Partial<MindMapDocument>) => updateDocument(id, (value) => value.mindmap?.generatedAt === generatedAt
+      ? { ...value, mindmap: { ...value.mindmap, ...patch, updatedAt: Date.now() }, updatedAt: Date.now() }
+      : value);
+    updateDocument(id, (value) => ({ ...value, mindmap: {
+      version: 1, title: partName(snapshot.video), source, sections, totalSections: chunks.length,
+      status: "running", generatedAt, updatedAt: Date.now(),
+    } }));
+    try {
+      for (let index = sections.length; index < chunks.length; index++) {
+        if (controller.signal.aborted) throw new Error("已停止");
+        const response = await fetch("/api/tutorial", {
+          method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
+          body: JSON.stringify({ mode: "mindmap-section", videoUrl: snapshot.video.url,
+            title: partName(snapshot.video), cid: snapshot.video.cid,
+            sourceCues: chunks[index], sourceKind: source.kind, sourceLabel: source.label,
+            sectionIndex: index + 1, sectionTotal: chunks.length }),
+        });
+        if (!response.ok) { await json(response); throw new Error("思维导图服务暂不可用，请重试。"); }
+        if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream"))
+          throw new Error("思维导图返回格式异常，请重试。");
+        let section: ReturnType<typeof readMindMapSection>, completed = false;
+        await readSSE(response.body, (payload) => {
+          if (controller.signal.aborted) return;
+          if (payload === "[DONE]") { completed = true; return; }
+          let event;
+          try { event = JSON.parse(payload); } catch { return; }
+          if (event.error || event.warning) throw new Error(event.error || event.warning);
+          if (event.mindmap) {
+            section = readMindMapSection(event.mindmap, chunks[index].map((cue) => cue.id));
+            if (!section) throw new Error("导图结构或来源未通过核对，已完成部分保留，请重试。");
+          }
+        });
+        if (!completed || !section) throw new Error("导图连接中断，本段尚未完成，请继续整理。");
+        sections = [...sections, { ...section, index, cueIds: chunks[index].map((cue) => cue.id) }];
+        change({ sections, status: "running", error: undefined });
+      }
+      change({ status: "complete", error: undefined });
+      return true;
+    } catch (error) {
+      change({ status: controller.signal.aborted ? "paused" : "error", error: controller.signal.aborted
+        ? "思维导图已停止，已完成的结构保留，可以继续。"
+        : error instanceof Error ? error.message : "导图整理失败，已完成部分保留。" });
+      return false;
+    }
+  }
+
+  async function generateMindMap(resume = true) {
+    if (!active || jobRef.current) return;
+    if (needsSource && !active.mindmap?.source) { setSourceOpen(true); return; }
+    const snapshot = active, id = active.id, controller = new AbortController();
+    jobRef.current = { id, controller, mode: "mindmap" };
+    setResultView("mindmap"); setNotice("");
+    setJob({ id, status: "正在准备思维导图的实际来源…" });
+    try {
+      const existing = resume ? snapshot.mindmap?.source : undefined;
+      const evidence = resume ? snapshot.note?.evidence : undefined;
+      const source = existing || (snapshot.transcript.trim()
+        ? await acquireFullSource(snapshot, id, controller)
+        : evidence?.coverage === "full" ? buildFullEvidence(normalizeFullSourceCues(evidence.cues), evidence.kind, evidence.label)
+        : await acquireFullSource(snapshot, id, controller));
+      setJob({ id, status: "正在整理思维导图的主题与细节…" });
+      const complete = await prepareMindMap(snapshot, source, controller, resume);
+      setNotice(complete ? "思维导图已准备好，可展开分支并查看原文。" : "导图未完成，已保存进度，可继续整理。");
+    } catch (error) {
+      setNotice(controller.signal.aborted ? "已停止读取，已有内容保留。" : error instanceof Error ? error.message : "无法取得导图来源，请重试。");
+    } finally {
+      if (jobRef.current?.controller === controller) { jobRef.current = null; setJob(null); }
+      flush();
+    }
+  }
+
   async function generateFull(resume = false) {
     if (!active || jobRef.current) return;
     setNotice("");
@@ -644,6 +752,7 @@ export default function Home() {
     let chunks: SourceCue[][] = [];
     let totalSections = resume ? snapshot.fullJob?.totalSections || 0 : 0;
     let unfinishedSection: FullDocumentSection | undefined;
+    let mapPromise: Promise<boolean> | undefined;
     setJob({
       id,
       status: `${resume ? "继续" : "准备生成"}${writingName}…`,
@@ -738,6 +847,7 @@ export default function Home() {
       }
       const fullSource = source;
       if (!fullSource) throw new Error("没有取得可整理的原文，请重试。");
+      mapPromise = prepareMindMap(snapshot, fullSource, controller).catch(() => false);
       setJob({
         id,
         status: `共 ${totalSections} 段，开始整理…`,
@@ -856,14 +966,18 @@ export default function Home() {
         generationState: "idle",
         updatedAt: Date.now(),
       }));
-      setNotice(`${writingName}已生成完成。`);
+      setJob({ id, status: `${writingName}已保存，正在完成思维导图…` });
+      const mapComplete = await mapPromise;
+      setNotice(`${writingName}已保存。${mapComplete ? "思维导图也已准备好。" : "导图尚未完成，可在导图视图继续。"}`);
     } catch (error) {
       const noArticleContent = writingMode === "article" && totalSections > 0 && sections.length === totalSections && sections.every((section) => section.omitted);
+      const stopped = controller.signal.aborted;
       const message = controller.signal.aborted
         ? `${writingName}已停止，已完成的部分已保存。`
         : error instanceof Error
           ? error.message
           : `${writingName}生成失败，请重试。`;
+      if (mapPromise) controller.abort();
       const preview = source
         ? partialFullDocument(snapshot, source, sections, unfinishedSection)
         : sections.length
@@ -875,7 +989,7 @@ export default function Home() {
         fullJob: noArticleContent ? undefined : source
           ? {
               mode: writingMode,
-              status: controller.signal.aborted ? "paused" : "error",
+              status: stopped ? "paused" : "error",
               source,
               totalCharacters:
                 source.totalCharacters || sourceCharacterCount(source.cues),
@@ -898,6 +1012,7 @@ export default function Home() {
         },
       }));
     } finally {
+      await mapPromise;
       if (jobRef.current?.controller === controller) {
         jobRef.current = null;
         setJob(null);
@@ -925,6 +1040,7 @@ export default function Home() {
       evidence: SourceEvidence | undefined,
       warning = "",
       completed = false;
+    let mapPromise: Promise<boolean> | undefined;
     const generatedAt = Date.now();
     updateDocument(id, (value) => ({
       ...value,
@@ -1027,7 +1143,13 @@ export default function Home() {
         if (event.error) throw new Error(event.error);
         if (event.status) setJob({ id, status: event.status });
         if (event.source) source = event.source;
-        if (event.evidence) evidence = event.evidence;
+        if (event.evidence) {
+          evidence = event.evidence;
+          if (!mapPromise && evidence?.coverage === "full" && evidence.cues?.length) {
+            const mapSource = buildFullEvidence(normalizeFullSourceCues(evidence.cues), evidence.kind, evidence.label);
+            mapPromise = prepareMindMap(snapshot, mapSource, controller).catch(() => false);
+          }
+        }
         if (event.warning) warning = event.warning;
         if (event.text) output += event.text;
         storeDraft(warning || undefined);
@@ -1051,12 +1173,18 @@ export default function Home() {
         generationState: "idle",
         updatedAt: Date.now(),
       }));
+      if (mapPromise) {
+        clearTimeout(timeout);
+        setJob({ id, status: "笔记已保存，正在完成思维导图…" });
+        await mapPromise;
+      }
     } catch (error) {
       const message = controller.signal.aborted
         ? "生成已停止或超时，已收到的内容保留。"
         : error instanceof Error
           ? error.message
           : "生成失败，请重试。";
+      if (mapPromise) controller.abort();
       storeDraft(message);
       updateDocument(id, (value) => ({
         ...value,
@@ -1064,6 +1192,7 @@ export default function Home() {
       }));
     } finally {
       clearTimeout(timeout);
+      await mapPromise;
       if (jobRef.current?.controller === controller) {
         jobRef.current = null;
         setJob(null);
@@ -1076,46 +1205,29 @@ export default function Home() {
     if (!item) return;
     const title = partName(item.video);
     const article = note?.mode === "article";
-    if (article && !includeArticleSource) {
-      saveTextFile(tutorialMarkdown(note.text), markdownFileName(title, "完整文稿"));
+    if (!includeArticleSource) {
+      let body = articleMarkdown(note?.text || "");
+      if (!body.trim().startsWith("# ")) body = `${articleMarkdown(`# ${title}`).trim()}\n\n${body}`;
+      if (note?.status === "partial") body += `\n> 本文尚未整理完成：${note.error || "仅包含已保存内容。"}\n`;
+      saveTextFile(body, markdownFileName(title, article ? "完整文稿" : note?.mode === "full" ? "学习笔记" : "摘要"));
       return;
     }
     const full = note?.mode === "full" || article;
     const evidence = note?.evidence || item.fullJob?.source;
     const cues = evidence?.cues || [];
-    const markdown = tutorialMarkdown(note?.text || "").replace(
-      /\[([^\]]+)\]\(source:(\d+)\)/g,
-      (match, label, id) =>
-        cues.some((cue) => cue.id === id)
-          ? full
-            ? `（原文 ${id}）`
-            : `[${label}][^source-${id}]`
-          : label,
-    );
+    const markdown = articleMarkdown(note?.text || "");
     const references = cues.length
       ? full
         ? `\n\n## 附：完整字幕原文（可核对）\n\n` +
           cues
             .map((cue) => {
-              const time =
-                cue.start !== undefined ? `[${duration(cue.start)}] ` : "";
-              const link =
-                cue.start !== undefined
-                  ? ` [回看](${cueUrl(item.video, cue)})`
-                  : "";
-              return `- **原文 ${cue.id}** ${time}${cue.text.replace(/\n/g, "\n  ")}${link}`;
+              return `- **原文 ${cue.id}** ${articleMarkdown(cue.text).trim().replace(/\n/g, "\n  ")}`;
             })
             .join("\n\n")
         : `\n\n## 来源原文\n\n` +
           cues
             .map((cue) => {
-              const time =
-                cue.start !== undefined ? `[${duration(cue.start)}] ` : "";
-              const link =
-                cue.start !== undefined
-                  ? ` [回看](${cueUrl(item.video, cue)})`
-                  : "";
-              return `[^source-${cue.id}]: ${time}${cue.text.replace(/\n/g, "\n    ")}${link}`;
+              return `[^source-${cue.id}]: ${articleMarkdown(cue.text).trim().replace(/\n/g, "\n    ")}`;
             })
             .join("\n\n")
       : "";
@@ -1124,9 +1236,6 @@ export default function Home() {
       `依据：${note?.source || "未生成"}`,
       `覆盖：${full && note?.status === "partial" ? "已取得原文，正文尚未全部整理" : coverage(evidence)}`,
       full ? `整理方式：${article ? "完整文稿" : "学习笔记"} · ${note?.sectionCount || 0} 段` : "整理方式：简短摘要",
-      note?.generatedAt
-        ? `生成时间：${new Date(note.generatedAt).toLocaleString("zh-CN")}`
-        : "",
       evidence?.limitation ? `说明：${evidence.limitation}` : "",
     ]
       .filter(Boolean)
@@ -1138,10 +1247,10 @@ export default function Home() {
     const body =
       full && markdown.trim().startsWith("# ")
         ? markdown
-        : `# ${title}\n\n${markdown}`;
+        : `${articleMarkdown(`# ${title}`).trim()}\n\n${markdown}`;
     const text = `${body}\n\n> ${metadata.replace(/\n/g, "  \n> ")}\n${warning}${references}\n\n## 我的备注\n\n${item.memo || "暂无备注"}\n${
       !full && item.transcript
-        ? `\n## 待整理的输入文本\n\n${item.transcript}\n`
+        ? `\n## 待整理的输入文本\n\n${articleMarkdown(item.transcript)}\n`
         : ""
     }`;
     saveTextFile(
@@ -1167,20 +1276,16 @@ export default function Home() {
     }
     const body = entries
       .map(({ part, item, note }) => {
-        const markdown = tutorialMarkdown(note.text)
-          .replace(/^#\s+[^\n]*\n+/, "")
-          .replace(/\[([^\]]+)\]\(source:\d+\)/g, "$1");
+        const markdown = articleMarkdown(note.text).replace(/^#\s+[^\n]*\n+/, "");
         const incomplete =
           note.status === "partial"
             ? `> 本节尚未完成：${note.error || "仅包含已保存的部分内容。"}\n\n`
             : "";
-        return `## P${part.page} ${part.title}\n\n${incomplete}${markdown}\n\n> 依据：${note.source || "未标注"} · ${coverage(note.evidence)}${
-          item.memo ? `\n>\n> 我的备注：${item.memo}` : ""
-        }`;
+        return `${articleMarkdown(`## ${part.title}`).trim()}\n\n${incomplete}${markdown}`;
       })
       .join("\n\n---\n\n");
     const completed = entries.filter(({ note }) => note.status === "complete").length;
-    const text = `# ${source.video.title}\n\n> 课程合集 · 已保存 ${entries.length}/${pages.length} 节，其中 ${completed} 节已完成；未完成章节单独标注。\n> 原视频：${source.video.url}\n\n${body}\n`;
+    const text = `${articleMarkdown(`# ${source.video.title}`).trim()}\n\n${completed < entries.length ? "> 合集包含尚未完成的章节，已在各节标明。\n\n" : ""}${body}\n`;
     saveTextFile(
       text,
       markdownFileName(source.video.title, `已整理${entries.length}节`),
@@ -1190,7 +1295,7 @@ export default function Home() {
   async function copyNote() {
     try {
       await navigator.clipboard.writeText(
-        tutorialMarkdown(shownNote?.text || ""),
+        shownArticle ? articleMarkdown(shownNote?.text || "") : tutorialMarkdown(shownNote?.text || ""),
       );
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
@@ -1765,6 +1870,36 @@ export default function Home() {
                       保存视频
                     </button>
                   </div>
+                  <div className="result-view-switch" role="tablist" aria-label="内容视图" onKeyDown={(event) => {
+                    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+                    event.preventDefault();
+                    const view = event.key === "Home" ? "text" : event.key === "End" ? "mindmap" : resultView === "text" ? "mindmap" : "text";
+                    setResultView(view);
+                    event.currentTarget.querySelector<HTMLButtonElement>(view === "text" ? "#text-view-tab" : "#map-view-tab")?.focus();
+                  }}>
+                    <button id="text-view-tab" role="tab" tabIndex={resultView === "text" ? 0 : -1} aria-selected={resultView === "text"} aria-controls="text-view" onClick={() => setResultView("text")}><FileText size={16} />正文</button>
+                    <button id="map-view-tab" role="tab" tabIndex={resultView === "mindmap" ? 0 : -1} aria-selected={resultView === "mindmap"} aria-controls="map-view" onClick={() => setResultView("mindmap")}><Network size={16} />思维导图{active.mindmap?.status === "running" && <Loader2 size={13} className="spin" />}</button>
+                  </div>
+                  {resultView === "mindmap" ? <section id="map-view" role="tabpanel" aria-labelledby="map-view-tab">
+                    <div className="mindmap-state">
+                      <div role="status">
+                        {active.mindmap ? <>
+                          <strong>{active.mindmap.status === "complete" ? "思维导图已完成" : active.mindmap.status === "running" ? "正在细化主题与层级" : "思维导图尚未完成"}</strong>
+                          <p>{active.mindmap.source.label} · 已完成 {active.mindmap.sections.length}/{active.mindmap.totalSections} 段{active.mindmap.status !== "complete" ? "，可先浏览原文结构" : ""}</p>
+                          {active.mindmap.status === "running" && <progress value={active.mindmap.sections.length} max={active.mindmap.totalSections} />}
+                          {active.mindmap.error && <p className="map-error">{active.mindmap.error}</p>}
+                          {active.mindmap.status === "complete" && active.mindmap.sections.some((section) => section.fallback) && <p>部分分支按原文组织，细节均可查看依据。</p>}
+                        </> : <><strong>把这一节的内容，展开看清楚</strong><p>{job?.id === active.id ? "取得实际字幕后会自动准备导图。" : "根据当前节的实际字幕，逐层展开主题、例子、操作与条件。"}</p></>}
+                      </div>
+                      <div className="mindmap-state-actions">
+                        {job?.id === active.id ? <button className="text-button" onClick={() => jobRef.current?.controller.abort()}><Square size={13} />停止本次解析</button>
+                          : <button className="secondary" disabled={!!job} onClick={() => void generateMindMap(active.mindmap?.status !== "complete")}><Network size={15} />{active.mindmap ? active.mindmap.status === "complete" ? "重新生成导图" : "继续整理导图" : shownNote?.evidence?.coverage === "full" ? "从已保存原文生成导图" : "读取视频并生成导图"}</button>}
+                      </div>
+                    </div>
+                    {mapRoot?.children.length ? <MindMap key={active.id} root={mapRoot} complete={active.mindmap?.status === "complete"} onSource={openCitation} />
+                      : active.mindmap?.status === "complete" ? <div className="empty-document"><Network size={30} /><h2>没有可整理的实质内容</h2><p>这份来源仅包含可略去的寒暄。原文仍可在内容来源中核对。</p></div>
+                      : <div className="empty-document"><Network size={30} /><h2>先有真实内容，再展开结构</h2><p>解析后会形成可缩放、折叠、搜索和核对来源的详细导图。</p></div>}
+                  </section> : <div id="text-view" role="tabpanel" aria-labelledby="text-view-tab">
                   {shownNote?.text && (shownNote.mode || "study") !== noteMode && !job && (
                     <p className="mode-result-notice">
                       下面是已保存的{modeLabel(shownNote.mode)}。选择方式只影响下次生成；新内容生成成功后，可查看上一版。
@@ -1906,7 +2041,7 @@ export default function Home() {
                         }}
                       >
                         {shownArticle
-                          ? tutorialMarkdown(shownNote.text).replace(/^#\s+[^\n]*\n+/, "")
+                          ? articleMarkdown(shownNote.text).replace(/^#\s+[^\n]*\n+/, "")
                           : tutorialMarkdown(shownNote.text)}
                       </ReactMarkdown>
                     </article>
@@ -1974,16 +2109,17 @@ export default function Home() {
                         {shownArticle
                           ? "导出文稿"
                           : shownNote.mode === "full"
-                          ? "导出文档（附原文）"
+                          ? "导出 Markdown"
                           : "导出 Markdown"}
                       </button>
-                      {shownArticle && (
+                      {shownNote?.text && (
                         <button className="text-button" onClick={() => exportNote(active, shownNote, true)}>
-                          导出文稿（附原文）
+                          导出核对稿（附原文）
                         </button>
                       )}
                     </div>
                   )}
+                  </div>}
                   <section className="personal-memo">
                     <label htmlFor="personal-memo">
                       <span className="memo-icon">✎</span>

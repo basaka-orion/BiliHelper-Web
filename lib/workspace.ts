@@ -6,6 +6,8 @@ import {
   chunkSourceCues,
 } from "./learning-source";
 import type { FullDocumentSection } from "./full-document";
+import type { MindMapNode, MindMapSection } from "./mindmap";
+import { buildMindMapUnits } from "./mindmap";
 
 export interface VideoInfo {
   platform: string;
@@ -54,6 +56,18 @@ export interface FullDocumentJob {
   updatedAt: number;
 }
 
+export interface MindMapDocument {
+  version: 1;
+  title: string;
+  source: SourceEvidence;
+  sections: (MindMapSection & { index: number; cueIds: string[] })[];
+  totalSections: number;
+  status: "running" | "complete" | "paused" | "error";
+  error?: string;
+  generatedAt: number;
+  updatedAt: number;
+}
+
 export interface LearningDocument {
   id: string;
   video: VideoInfo;
@@ -66,6 +80,7 @@ export interface LearningDocument {
   draft?: LearningNote;
   noteMode: "study" | "full" | "article";
   fullJob?: FullDocumentJob;
+  mindmap?: MindMapDocument;
   generationState: "idle" | "running" | "interrupted";
   scrollY: number;
   updatedAt: number;
@@ -83,6 +98,8 @@ const MAX_STORAGE_CHARACTERS = 2 * 1024 * 1024;
 const MAX_EMPTY_DOCUMENTS = 24;
 const MAX_READ_DOCUMENTS = 10000;
 const MAX_READ_CHARACTERS = 8 * 1024 * 1024;
+const MAX_MINDMAP_NODES = 18000;
+const MAX_MINDMAP_CHARACTERS = 720000;
 const hasOwn = (object: object, key: string) =>
   Object.prototype.hasOwnProperty.call(object, key);
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -381,6 +398,136 @@ function readFullJob(value: unknown, recover: boolean): FullDocumentJob | undefi
   return job;
 }
 
+/** Validate one API result before either rendering it or adding it to saved progress. */
+export function readMindMapSection(value: unknown, allowedCueIds: string[]): MindMapSection | undefined {
+  if (!isRecord(value) || value.version !== 1 || typeof value.fallback !== "boolean" ||
+    !Array.isArray(value.nodes) || value.nodes.length > MAX_MINDMAP_NODES) return;
+  const allowed = new Set(allowedCueIds), nodeIds = new Set<string>();
+  let nodeCount = 0, characters = 0;
+  const readIds = (input: unknown): string[] | undefined => {
+    if (!Array.isArray(input) || input.length > allowed.size) return;
+    const seen = new Set<string>();
+    for (const id of input) {
+      if (typeof id !== "string" || !allowed.has(id) || seen.has(id)) return;
+      seen.add(id);
+    }
+    return Array.from(seen);
+  };
+  const sameIds = (first: string[], second: string[]) => {
+    const other = new Set(second);
+    return first.length === other.size && first.every((id) => other.has(id));
+  };
+  const readNode = (input: unknown, depth: number): MindMapNode | undefined => {
+    if (!isRecord(input) || depth > 4 || ++nodeCount > MAX_MINDMAP_NODES ||
+      typeof input.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(input.id) ||
+      nodeIds.has(input.id) || !text(input.text, 9000)?.trim() ||
+      !Array.isArray(input.children) || input.children.length > MAX_MINDMAP_NODES) return;
+    characters += (input.text as string).length;
+    if (characters > MAX_MINDMAP_CHARACTERS) return;
+    const sourceIds = readIds(input.sourceIds);
+    if (!sourceIds?.length) return;
+    nodeIds.add(input.id);
+    const children: MindMapNode[] = [];
+    for (const child of input.children) {
+      const node = readNode(child, depth + 1);
+      if (!node) return;
+      children.push(node);
+    }
+    if (children.length && !sameIds(sourceIds, children.flatMap((child) => child.sourceIds))) return;
+    return { id: input.id, text: input.text as string, sourceIds, children };
+  };
+  const nodes: MindMapNode[] = [];
+  for (const input of value.nodes) {
+    const node = readNode(input, 1);
+    if (!node) return;
+    nodes.push(node);
+  }
+  const sourceIds = readIds(value.sourceIds);
+  if (!sourceIds || !sameIds(sourceIds, nodes.flatMap((node) => node.sourceIds))) return;
+  return { version: 1, nodes, sourceIds, fallback: value.fallback };
+}
+
+function readMindMap(value: unknown, recover: boolean): MindMapDocument | undefined {
+  if (
+    !isRecord(value) || value.version !== 1 ||
+    !text(value.title, 1000)?.trim() ||
+    !validNumber(value.totalSections) || !Number.isInteger(value.totalSections) ||
+    value.totalSections < 1 || value.totalSections > 200 ||
+    !Array.isArray(value.sections) || value.sections.length > 200 ||
+    !["running", "complete", "paused", "error"].includes(value.status as string) ||
+    !validNumber(value.generatedAt) || !validNumber(value.updatedAt) ||
+    (value.error !== undefined && text(value.error, 10000) === undefined)
+  ) return;
+  const source = readEvidence(value.source);
+  if (!source || source.coverage !== "full" || !source.cues.length || !isRecord(value.source)) return;
+  // Evidence normalization may discard unsafe fields for old notes, but a map's
+  // citations and source must round-trip without silently changing their meaning.
+  for (const key of ["totalCharacters", "analyzedCharacters", "limitation"] as const)
+    if (source[key] !== value.source[key]) return;
+  if (source.cues.some((cue, index) => {
+    const original = (value.source as Record<string, unknown>).cues;
+    const row = Array.isArray(original) ? original[index] : undefined;
+    return !isRecord(row) || cue.start !== row.start || cue.end !== row.end;
+  })) return;
+  let chunks: SourceEvidence["cues"][];
+  try {
+    chunks = chunkSourceCues(source.cues);
+  } catch {
+    return;
+  }
+  const sections: MindMapDocument["sections"] = [];
+  const nodeIds = new Set<string>();
+  let nodeCount = 0, characters = 0, invalidSection = false;
+  for (const row of value.sections) {
+    const index = sections.length;
+    const ids = chunks[index]?.map((cue) => cue.id);
+    if (!isRecord(row) || row.version !== 1 || row.index !== index || !ids ||
+      !Array.isArray(row.cueIds) || row.cueIds.length !== ids.length ||
+      row.cueIds.some((id, cueIndex) => id !== ids[cueIndex]) ||
+      typeof row.fallback !== "boolean" || !Array.isArray(row.nodes) ||
+      row.nodes.length > MAX_MINDMAP_NODES) {
+      invalidSection = true;
+      break;
+    }
+    const section = readMindMapSection(row, ids);
+    if (!section || (!section.nodes.length && buildMindMapUnits(chunks[index]).length > 0)) {
+      invalidSection = true;
+      break;
+    }
+    const remaining = [...section.nodes];
+    while (remaining.length) {
+      const node = remaining.pop()!;
+      nodeCount++;
+      characters += node.text.length;
+      if (nodeIds.has(node.id) || nodeCount > MAX_MINDMAP_NODES || characters > MAX_MINDMAP_CHARACTERS) {
+        invalidSection = true;
+        break;
+      }
+      nodeIds.add(node.id);
+      remaining.push(...node.children);
+    }
+    if (invalidSection) break;
+    sections.push({ ...section, index, cueIds: ids });
+  }
+  const boundaryChanged = value.totalSections !== chunks.length;
+  const incomplete = value.status === "complete" && sections.length !== chunks.length;
+  if (!recover && (invalidSection || boundaryChanged || incomplete)) return;
+  const recoveryReason = invalidSection || boundaryChanged
+    ? `原文分段范围或导图内容已更新，已保留 ${sections.length} 段匹配结果，将从第 ${sections.length + 1} 段重试（共 ${chunks.length} 段）。`
+    : incomplete ? `先前思维导图尚未完成，已保留 ${sections.length} 段，将从第 ${sections.length + 1} 段继续整理（共 ${chunks.length} 段）。` : undefined;
+  return {
+    version: 1,
+    title: value.title as string,
+    source,
+    sections,
+    totalSections: chunks.length,
+    status: recoveryReason ? "error" : recover && value.status === "running" ? "paused" : value.status as MindMapDocument["status"],
+    ...(recoveryReason ? { error: recoveryReason } : value.error !== undefined ? { error: value.error as string } : {}),
+    generatedAt: value.generatedAt,
+    updatedAt: value.updatedAt,
+  };
+}
+
 export function createDocument(video: VideoInfo): LearningDocument {
   const normalized = readVideo(video);
   if (!normalized)
@@ -449,6 +596,8 @@ function readDocument(
   }
   if (recover && document.fullJob?.status === "running")
     document.fullJob.status = "paused";
+  const mindmap = readMindMap(value.mindmap, recover);
+  if (mindmap) document.mindmap = mindmap;
   return document;
 }
 
@@ -528,6 +677,7 @@ function hasWork(document: LearningDocument): boolean {
     document.memo ||
     document.transcript ||
     document.fullJob ||
+    document.mindmap ||
     document.generationState !== "idle"
   );
 }
@@ -583,6 +733,11 @@ export function serializeWorkspace(workspace: Workspace): string {
     ) {
       throw new Error(
         "完整文档的进度超出本机保存范围，当前修改尚未保存。请先导出重要笔记。",
+      );
+    }
+    if (original.mindmap !== undefined && !saved.mindmap) {
+      throw new Error(
+        "思维导图的内容或进度超出本机保存范围，当前修改尚未保存。请先导出重要笔记。",
       );
     }
   }
