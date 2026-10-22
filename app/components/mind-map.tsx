@@ -76,7 +76,9 @@ export function MindMap({ root, complete, onSource }: {
       spacingHorizontal: 64, spacingVertical: 14, paddingX: 10, fitRatio: 0.9,
       maxInitialScale: 1, embedGlobalCSS: true, style: () => mapCss,
       color: (node) => colors[(Number(node.state.path.split(".")[1] || 1) - 1) % colors.length],
-      scrollForPan: false,
+      // Keep ordinary wheel scrolling available to the page. D3 still handles
+      // dragging and Ctrl+wheel zoom; toolbar zoom works on every device.
+      scrollForPan: true, pan: false,
     });
     mapRef.current = mm;
     setRenderError("");
