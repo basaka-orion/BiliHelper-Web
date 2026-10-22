@@ -144,6 +144,35 @@ test("article titles are removed only on exact match and code spans can cross li
   assert.ok(markdown.includes("`const value = \n[查看原文](source:2)`"));
 });
 
+test("article code fences remain protected across processing sections, including headings and distinct numeric values", () => {
+  const parts = [
+    "先展示完整示例。\n\n```md\nlimit=7012",
+    "# 从视频到完整文章\n[查看原文](source:1)\nlimit=7013",
+    "[回看](source:2)\nlimit=7014\n```\n\n示例结束。[查看原文](source:3)",
+  ];
+  const markdown = assembleArticle({ ...articleInput, sections: parts.map((body, index) => ({
+    index, markdown: body, cueIds: [String(index + 1)],
+  })) });
+  assert.ok(markdown.includes(parts.join("\n\n").replace(/\[查看原文\]\(source:3\)$/, "")));
+  assert.match(markdown, /```md\nlimit=7012\n\n# 从视频到完整文章\n\[查看原文\]\(source:1\)\nlimit=7013\n\n\[回看\]\(source:2\)\nlimit=7014\n```/);
+  assert.doesNotMatch(markdown, /示例结束。\[查看原文\]/);
+});
+
+test("article inline code state spans processing sections without deleting citation-like strings or code headings", () => {
+  const parts = [
+    "正文后是代码 ``const first = 8101;",
+    "# 从视频到完整文章\n[查看原文](source:1)\nconst second = 8102;",
+    "const third = 8103; [回看](source:2)``\n\n恢复正文。[回看](source:3)",
+  ];
+  const markdown = assembleArticle({ ...articleInput, sections: parts.map((body, index) => ({
+    index, markdown: body, cueIds: [String(index + 1)],
+  })) });
+  assert.ok(markdown.includes(parts.join("\n\n").replace(/\[回看\]\(source:3\)$/, "")));
+  assert.ok(markdown.includes("# 从视频到完整文章\n[查看原文](source:1)"));
+  assert.ok(markdown.includes("const third = 8103; [回看](source:2)``"));
+  assert.doesNotMatch(markdown, /恢复正文。\[回看\]/);
+});
+
 test("article assembly validates the complete sequence before skipping first, middle and last advertising sections", () => {
   const omitted = (index) => ({ index, markdown: "", cueIds: [String(index + 1)], omitted: true });
   const markdown = assembleArticle({ ...articleInput, sections: [

@@ -169,9 +169,10 @@ export function assembleArticle(input: FullDocumentInput): string {
     throw new Error("文稿包含缺失或未完整输出的段落，请继续整理后再合并。");
   const title = (input.partTitle?.trim() || input.title.trim() || "视频完整文稿")
     .replace(/\s+/g, " ");
-  const body = sections.filter((section) => !section.omitted)
-    .map((section) => articleSection(section.markdown, title)).filter(Boolean)
-    .join("\n\n");
+  // Processing boundaries may fall inside a code block or code span. Clean the
+  // combined body once so its code state survives from one section to the next.
+  const body = articleSection(sections.filter((section) => !section.omitted)
+    .map((section) => section.markdown).join("\n\n"), title);
   if (!body) throw new Error("原文只有寒暄/广告/重复，没有可生成的文稿正文");
   const status = input.partial ? "\n\n> 文稿尚未整理完成，以上是已经完成的部分。" : "";
   return `# ${title}\n\n${body}${status}\n`;
