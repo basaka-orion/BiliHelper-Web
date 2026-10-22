@@ -59,6 +59,7 @@ export function MindMap({ root, complete, onSource }: {
   const index = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
   const selected = index.get(selectedId);
   const matches = query.trim() ? nodes.filter((node) => mindMapNodeText(node).toLowerCase().includes(query.trim().toLowerCase())).slice(0, 30) : [];
+  const overviewDepth = root.children.length === 1 ? 2 : 1;
 
   useEffect(() => {
     if (!selectedId) return;
@@ -80,12 +81,12 @@ export function MindMap({ root, complete, onSource }: {
     mapRef.current = mm;
     setRenderError("");
     setSelectedId("");
-    mm.setData(mindMapViewData(root, 1)).then(() => { if (!disposed) return readableView(mm); })
+    mm.setData(mindMapViewData(root, overviewDepth)).then(() => { if (!disposed) return readableView(mm); })
       .catch(() => { if (!disposed) { setRenderError("图形暂时无法显示，完整内容可在文字大纲中查看。"); setOutline(true); } });
     const observer = new ResizeObserver(() => { if (!disposed && svg.clientWidth) void readableView(mm).catch(() => {}); });
     observer.observe(svg);
     return () => { disposed = true; observer.disconnect(); mm.destroy(); if (mapRef.current === mm) mapRef.current = undefined; };
-  }, [root]);
+  }, [root, overviewDepth]);
 
   async function choose(node: MindMapNode) {
     setSelectedId(node.id); setActionError("");
@@ -109,7 +110,7 @@ export function MindMap({ root, complete, onSource }: {
     const mm = mapRef.current;
     if (!mm) return;
     setExpanded(all);
-    try { await mm.setData(mindMapViewData(root, all ? Number.MAX_SAFE_INTEGER : 1)); await readableView(mm); }
+    try { await mm.setData(mindMapViewData(root, all ? Number.MAX_SAFE_INTEGER : overviewDepth)); await readableView(mm); }
     catch { setActionError("图形布局暂不可用，可切换文字大纲继续查看。"); }
   }
 
