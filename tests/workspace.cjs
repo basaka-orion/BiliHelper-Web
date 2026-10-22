@@ -280,3 +280,186 @@ test("large expendable metadata can be pruned to fit without evicting the active
     active.note,
   );
 });
+
+test("full document mode, completed sections and resume state survive a reload", () => {
+  const document = createDocument(video(1));
+  const source = {
+    kind: "subtitle",
+    label: "完整字幕",
+    coverage: "full",
+    totalCharacters: 7001,
+    analyzedCharacters: 7001,
+    limitation: "已整理全部字幕。",
+    cues: [
+      { id: "1", text: "第一段。".repeat(875), start: 0, end: 2 },
+      { id: "2", text: "第二段。".repeat(875), start: 2, end: 4 },
+    ],
+  };
+  document.noteMode = "full";
+  document.generationState = "running";
+  document.fullJob = {
+    status: "running",
+    source,
+    totalCharacters: 7001,
+    totalSections: 2,
+    sections: [
+      { index: 0, markdown: "## 第一段\n\n内容。[查看原文](source:1)", cueIds: ["1"] },
+    ],
+    startedAt: 1000,
+    updatedAt: 2000,
+  };
+  document.draft = {
+    text: "## 第一段\n\n内容。[查看原文](source:1)",
+    source: "完整字幕",
+    status: "partial",
+    generatedAt: 1000,
+    mode: "full",
+    sectionCount: 1,
+  };
+  document.updatedAt = 2500;
+  const restored = readWorkspace(serializeWorkspace(workspaceWith(document)));
+  const saved = restored.documents[document.id];
+  assert.equal(saved.noteMode, "full");
+  assert.equal(saved.generationState, "interrupted");
+  assert.equal(saved.fullJob.status, "paused");
+  assert.equal(saved.fullJob.totalSections, 2);
+  assert.equal(saved.fullJob.sections.length, 1);
+  assert.equal(saved.fullJob.sections[0].cueIds[0], "1");
+  assert.equal(saved.fullJob.source.cues.length, 2);
+  assert.equal(saved.draft.mode, "full");
+  assert.equal(saved.draft.sectionCount, 1);
+});
+
+test("a completed full note keeps its mode and complete source evidence", () => {
+  const document = createDocument(video(1));
+  document.noteMode = "full";
+  document.note = {
+    ...note("# 完整文档\n\n## 第一章\n\n正文。[查看原文](source:1)"),
+    mode: "full",
+    sectionCount: 3,
+    evidence: {
+      kind: "subtitle",
+      label: "完整字幕",
+      coverage: "full",
+      totalCharacters: 12,
+      analyzedCharacters: 12,
+      limitation: "已整理全部字幕。",
+      cues: [
+        { id: "1", text: "第一段原文。", start: 0, end: 2 },
+        { id: "2", text: "第二段原文。", start: 2, end: 4 },
+        { id: "3", text: "第三段原文。", start: 4, end: 6 },
+      ],
+    },
+  };
+  const restored = readWorkspace(serializeWorkspace(workspaceWith(document)));
+  const saved = restored.documents[document.id].note;
+  assert.equal(saved.mode, "full");
+  assert.equal(saved.sectionCount, 3);
+  assert.equal(saved.evidence.coverage, "full");
+  assert.equal(saved.evidence.cues.length, 3);
+});
+
+test("legacy documents default to full writing while explicit study preference and existing notes remain", () => {
+  const document = createDocument(video(1));
+  document.note = note("既有学习笔记");
+  delete document.noteMode;
+  let restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.noteMode, "full");
+  assert.equal(restored.note.text, "既有学习笔记");
+  document.noteMode = "study";
+  restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.noteMode, "study");
+});
+
+test("a length-limited saved full section resumes before that section and cannot be saved as completed work", () => {
+  const document = createDocument(video(1));
+  document.fullJob = {
+    status: "paused",
+    source: { kind: "manual", label: "字幕", coverage: "full", cues: [
+      { id: "1", text: "甲".repeat(3500) }, { id: "2", text: "乙".repeat(3500) },
+    ] },
+    totalCharacters: 7001, totalSections: 2, startedAt: 1, updatedAt: 2,
+    sections: [
+      { index: 0, markdown: "## 第一节\n完整内容", cueIds: ["1"] },
+      { index: 1, markdown: "## 第二节\n尚未输出完", cueIds: ["2"], warning: "输出达到长度限制" },
+    ],
+  };
+  assert.throws(() => serializeWorkspace(workspaceWith(document)), /进度超出本机保存范围/);
+  const restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.fullJob.sections.length, 1);
+  assert.equal(restored.fullJob.status, "error");
+  assert.match(restored.fullJob.error, /第 2 段重新整理/);
+  assert.equal(restored.fullJob.source.cues.length, 2);
+});
+
+function resumableJob(cues, sections, totalSections) {
+  return {
+    status: "paused",
+    source: { kind: "manual", label: "完整字幕", coverage: "full", cues },
+    totalCharacters: cues.map(cue => cue.text).join("\n").length,
+    totalSections, sections, startedAt: 1, updatedAt: 2,
+  };
+}
+
+test("resume rechecks old chunk boundaries instead of skipping new smaller source ranges", () => {
+  const document = createDocument(video(1));
+  const cues = [1, 2, 3, 4].map(id => ({ id: String(id), text: `内容${id}`.repeat(1000) }));
+  document.fullJob = resumableJob(cues, [
+    { index: 0, markdown: "## 旧大段\n曾整理原文 1 和 2", cueIds: ["1", "2"] },
+  ], 2);
+  const state = workspaceWith(document);
+  assert.throws(() => serializeWorkspace(state), /进度超出本机保存范围/);
+  const restored = readWorkspace(JSON.stringify(state)).documents[document.id];
+  assert.equal(restored.fullJob.totalSections, 4);
+  assert.equal(restored.fullJob.sections.length, 0);
+  assert.match(restored.fullJob.error, /分段范围已更新.*保留 0 段/);
+  assert.deepEqual(restored.fullJob.source.cues, cues);
+});
+
+test("resume keeps only the consecutive matching prefix and checks source id order", () => {
+  const document = createDocument(video(1));
+  const cues = [
+    { id: "1", text: "甲".repeat(3500) },
+    { id: "2", text: "乙".repeat(1000) },
+    { id: "3", text: "丙".repeat(1000) },
+    { id: "4", text: "丁".repeat(1000) },
+    { id: "5", text: "戊".repeat(3500) },
+  ];
+  document.fullJob = resumableJob(cues, [
+    { index: 0, markdown: "## 匹配\n完整保留", cueIds: ["1"] },
+    { index: 1, markdown: "## 错序\n应重新整理", cueIds: ["3", "2", "4"] },
+    { index: 2, markdown: "## 不可跨过中间的错配\n重做", cueIds: ["5"] },
+  ], 3);
+  assert.throws(() => serializeWorkspace(workspaceWith(document)), /进度超出本机保存范围/);
+  const restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.fullJob.sections.length, 1);
+  assert.equal(restored.fullJob.sections[0].markdown, "## 匹配\n完整保留");
+  assert.equal(restored.fullJob.totalSections, 3);
+  assert.match(restored.fullJob.error, /第 2 段继续整理/);
+});
+
+test("resume updates only total section count when all completed ranges still match", () => {
+  const document = createDocument(video(1));
+  const cues = [1, 2, 3].map(id => ({ id: String(id), text: "字".repeat(3500) }));
+  document.fullJob = resumableJob(cues, [
+    { index: 0, markdown: "## 保留\n第一段已完成", cueIds: ["1"] },
+  ], 2);
+  const restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.fullJob.sections.length, 1);
+  assert.equal(restored.fullJob.totalSections, 3);
+  assert.match(restored.fullJob.error, /第 2 段继续整理/);
+  assert.doesNotThrow(() => serializeWorkspace(workspaceWith(restored)));
+});
+
+test("an oversized legacy source preserves draft evidence without renumbering its citations", () => {
+  const document = createDocument(video(1));
+  const source = [{ id: "1", text: "旧".repeat(6000) }];
+  document.fullJob = resumableJob(source, [], 1);
+  document.draft = { ...note("## 旧草稿\n这条来自旧原文。[查看原文](source:1)"), status: "partial", mode: "full" };
+  delete document.draft.evidence;
+  const restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.fullJob, undefined);
+  assert.equal(restored.draft.text, document.draft.text);
+  assert.equal(restored.draft.evidence.cues[0].text.length, 6000);
+  assert.match(restored.draft.error, /重新读取原文/);
+});

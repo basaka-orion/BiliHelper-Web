@@ -1,5 +1,11 @@
 import { parseVideoLink } from "./video-url";
 import type { SourceEvidence } from "./learning-source";
+import {
+  MAX_SOURCE_CUES,
+  MAX_TRANSCRIPT_CHARACTERS,
+  chunkSourceCues,
+} from "./learning-source";
+import type { FullDocumentSection } from "./full-document";
 
 export interface VideoInfo {
   platform: string;
@@ -32,6 +38,19 @@ export interface LearningNote {
   status: "complete" | "partial";
   error?: string;
   generatedAt: number;
+  mode?: "study" | "full";
+  sectionCount?: number;
+}
+
+export interface FullDocumentJob {
+  status: "running" | "paused" | "error";
+  source: SourceEvidence;
+  totalCharacters: number;
+  totalSections: number;
+  sections: FullDocumentSection[];
+  error?: string;
+  startedAt: number;
+  updatedAt: number;
 }
 
 export interface LearningDocument {
@@ -44,6 +63,8 @@ export interface LearningDocument {
   note?: LearningNote;
   previousNote?: LearningNote;
   draft?: LearningNote;
+  noteMode: "study" | "full";
+  fullJob?: FullDocumentJob;
   generationState: "idle" | "running" | "interrupted";
   scrollY: number;
   updatedAt: number;
@@ -179,7 +200,7 @@ function readEvidence(value: unknown): SourceEvidence | undefined {
     typeof value.label !== "string" ||
     value.label.length > 1000 ||
     !Array.isArray(value.cues) ||
-    value.cues.length > 20000
+    value.cues.length > MAX_SOURCE_CUES
   )
     return;
   const cues: SourceEvidence["cues"] = [];
@@ -195,7 +216,7 @@ function readEvidence(value: unknown): SourceEvidence | undefined {
     )
       return;
     characters += valueCue.text.length;
-    if (characters > 20000) return;
+    if (characters > MAX_TRANSCRIPT_CHARACTERS) return;
     const cue: SourceEvidence["cues"][number] = {
       id: valueCue.id,
       text: valueCue.text,
@@ -242,7 +263,114 @@ function readNote(value: unknown): LearningNote | undefined {
     error = text(value.error, 10000);
   if (evidence) note.evidence = evidence;
   if (error !== undefined) note.error = error;
+  if (value.mode === "full" || value.mode === "study") note.mode = value.mode;
+  if (
+    validNumber(value.sectionCount) &&
+    Number.isInteger(value.sectionCount) &&
+    value.sectionCount >= 1 &&
+    value.sectionCount <= 200
+  )
+    note.sectionCount = value.sectionCount;
   return note;
+}
+
+function readFullJob(value: unknown, recover: boolean): FullDocumentJob | undefined {
+  if (!isRecord(value)) return;
+  const source = readEvidence(value.source);
+  if (!source || source.coverage !== "full") return;
+  if (
+    !validNumber(value.totalCharacters) ||
+    value.totalCharacters <= 0 ||
+    value.totalCharacters > MAX_TRANSCRIPT_CHARACTERS ||
+    !validNumber(value.totalSections) ||
+    !Number.isInteger(value.totalSections) ||
+    value.totalSections < 1 ||
+    value.totalSections > 200 ||
+    !Array.isArray(value.sections) ||
+    value.sections.length > value.totalSections ||
+    !["running", "paused", "error"].includes(value.status as string)
+  )
+    return;
+  const sections: FullDocumentSection[] = [];
+  const indexes = new Set<number>();
+  for (const row of value.sections) {
+    if (!isRecord(row)) return;
+    if (
+      !validNumber(row.index) ||
+      !Number.isInteger(row.index) ||
+      row.index < 0 ||
+      row.index >= (value.totalSections as number) ||
+      indexes.has(row.index) ||
+      text(row.markdown, 400000) === undefined ||
+      !Array.isArray(row.cueIds) ||
+      row.cueIds.length > MAX_SOURCE_CUES
+    )
+      return;
+    const cueIds: string[] = [];
+    for (const id of row.cueIds) {
+      if (typeof id !== "string" || !/^[1-9]\d{0,5}$/.test(id)) return;
+      cueIds.push(id);
+    }
+    const section: FullDocumentSection = {
+      index: row.index,
+      markdown: row.markdown as string,
+      cueIds,
+    };
+    const warning = text(row.warning, 2000);
+    if (warning !== undefined) section.warning = warning;
+    sections.push(section);
+    indexes.add(row.index);
+  }
+  sections.sort((a, b) => a.index - b.index);
+  let chunks: SourceEvidence["cues"][];
+  try {
+    chunks = chunkSourceCues(source.cues);
+  } catch {
+    // Oversized legacy cues require fresh acquisition instead of reassigning ids:
+    // old draft citations must never silently point at newly renumbered source text.
+    return;
+  }
+  const firstIncomplete = sections.findIndex((section, index) => {
+    const ids = chunks[index]?.map((cue) => cue.id);
+    return (
+      section.index !== index ||
+      !section.markdown.trim() ||
+      !!section.warning ||
+      !ids ||
+      section.cueIds.length !== ids.length ||
+      section.cueIds.some((id, cueIndex) => id !== ids[cueIndex])
+    );
+  });
+  const boundaryChanged = value.totalSections !== chunks.length;
+  // A saved index is not proof of coverage. Segmentation may change between
+  // releases, so only a continuous prefix with the same source ids can resume.
+  if (!recover && (firstIncomplete >= 0 || boundaryChanged)) return;
+  const incompleteWarning = firstIncomplete >= 0
+    ? sections[firstIncomplete].warning : undefined;
+  if (firstIncomplete >= 0) sections.splice(firstIncomplete);
+  const recoveryReason = incompleteWarning
+    ? `先前输出未完成，将从第 ${sections.length + 1} 段重新整理。${incompleteWarning}`
+    : firstIncomplete >= 0 || boundaryChanged
+      ? `原文分段范围已更新，已保留 ${sections.length} 段匹配结果，将从第 ${sections.length + 1} 段继续整理（共 ${chunks.length} 段）。`
+      : undefined;
+  const startedAt = validNumber(value.startedAt) ? value.startedAt : Date.now();
+  const updatedAt = validNumber(value.updatedAt) ? value.updatedAt : startedAt;
+  const job: FullDocumentJob = {
+    status:
+      recoveryReason ? "error" : recover && value.status === "running"
+        ? "paused"
+        : (value.status as FullDocumentJob["status"]),
+    source,
+    totalCharacters: value.totalCharacters as number,
+    totalSections: chunks.length,
+    sections,
+    startedAt,
+    updatedAt,
+  };
+  const error = text(value.error, 10000);
+  if (recoveryReason) job.error = recoveryReason;
+  else if (error !== undefined) job.error = error;
+  return job;
 }
 
 export function createDocument(video: VideoInfo): LearningDocument {
@@ -256,6 +384,7 @@ export function createDocument(video: VideoInfo): LearningDocument {
     transcriptOffset: 0,
     subtitleIndex: "auto",
     memo: "",
+    noteMode: "full",
     generationState: "idle",
     scrollY: 0,
     updatedAt: Date.now(),
@@ -285,6 +414,7 @@ function readDocument(
       : 0;
   document.scrollY = validNumber(value.scrollY) ? value.scrollY : 0;
   document.updatedAt = validNumber(value.updatedAt) ? value.updatedAt : 0;
+  document.noteMode = value.noteMode === "study" ? "study" : "full";
   document.generationState = ["running", "interrupted"].includes(
     value.generationState as string,
   )
@@ -296,6 +426,19 @@ function readDocument(
     const note = readNote(value[key]);
     if (note) document[key] = note;
   }
+  const fullJob = readFullJob(value.fullJob, recover);
+  if (fullJob) document.fullJob = fullJob;
+  else if (recover && isRecord(value.fullJob) && document.draft) {
+    const oldSource = readEvidence(value.fullJob.source);
+    if (oldSource) {
+      document.draft.evidence = document.draft.evidence || oldSource;
+      document.draft.error = document.draft.error ||
+        "先前完整文档的分段规格已更新，请重新读取原文后整理；已有草稿与其原文已保留。";
+      document.generationState = "interrupted";
+    }
+  }
+  if (recover && document.fullJob?.status === "running")
+    document.fullJob.status = "paused";
   return document;
 }
 
@@ -374,6 +517,7 @@ function hasWork(document: LearningDocument): boolean {
     document.draft ||
     document.memo ||
     document.transcript ||
+    document.fullJob ||
     document.generationState !== "idle"
   );
 }
@@ -419,6 +563,17 @@ export function serializeWorkspace(workspace: Workspace): string {
           "部分笔记内容超出本机保存范围，当前修改尚未保存。请先导出重要笔记。",
         );
       }
+    }
+    if (
+      original.fullJob &&
+      (!saved.fullJob ||
+        saved.fullJob.sections.length !== original.fullJob.sections.length ||
+        saved.fullJob.source.cues.length !==
+          original.fullJob.source.cues.length)
+    ) {
+      throw new Error(
+        "完整文档的进度超出本机保存范围，当前修改尚未保存。请先导出重要笔记。",
+      );
     }
   }
   const empty = Object.values(safe.documents)

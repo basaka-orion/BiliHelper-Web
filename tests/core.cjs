@@ -68,6 +68,7 @@ function loadTypeScript(relative, mocks = {}, globals = {}) {
     if (Object.prototype.hasOwnProperty.call(mocks, name)) return mocks[name]
     if (name.endsWith('/video-url')) return require(path.join(compiled, 'video-url.js'))
     if (name.endsWith('/bili-metadata')) return require(path.join(compiled, 'bili-metadata.js'))
+    if (name.endsWith('/download-transfer')) return require(path.join(compiled, 'download-transfer.js'))
     throw new Error(`Unexpected import: ${name}`)
   }
   new Function('require', 'module', 'exports', ...Object.keys(globals), output)(localRequire, module, module.exports, ...Object.values(globals))
@@ -186,4 +187,122 @@ test('renders provider Markdown wrappers while retaining nested programming exam
   const document = '# 标题\n\n```python\nprint("ok")\n```'
   assert.equal(tutorialMarkdown('```markdown\n' + document + '\n```'), document)
   assert.equal(tutorialMarkdown('```python\nprint("ok")\n```'), '```python\nprint("ok")\n```')
+})
+
+class DownloadHttpError extends Error {
+  constructor(message, status = 502) { super(message); this.status = status }
+}
+function downloadRoute({ biliWbiJson, biliJson = async () => { throw new Error('unexpected plain API') } }) {
+  return loadTypeScript('app/api/download/route.ts', {
+    '../../../lib/upstream': {
+      biliWbiJson,
+      biliJson,
+      biliHeaders: {},
+      HttpError: DownloadHttpError,
+      errorResponse: error => Response.json({ error: error.message }, { status: error.status || 500 }),
+    },
+  })
+}
+function downloadRequest(body) {
+  return { json: async () => ({
+    url: 'https://www.bilibili.com/video/BV1wD4y1o7AS',
+    bvid: 'BV1wD4y1o7AS',
+    cid: 42507765269,
+    quality: 64,
+    ...body,
+  }) }
+}
+const mediaPart = {
+  url: 'https://cn-hz-ct-01-01.bilivideo.com/upgcxcode/1/2/3.mp4?token=test',
+  backup_url: ['https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.mp4?token=test'],
+  size: 19536124,
+}
+
+test('download info mode returns a direct CDN URL for large files without proxying bytes', async () => {
+  const route = downloadRoute({ biliWbiJson: async () => ({ durl: [mediaPart], quality: 64, format: 'mp4720' }) })
+  const response = await route.POST(downloadRequest({ info: true })), data = await response.json()
+  assert.equal(response.status, 200)
+  assert.equal(data.mode, 'direct')
+  assert.equal(data.url, mediaPart.url)
+  assert.equal(data.size, 19536124)
+  assert.equal(data.quality, 64)
+  assert.equal(data.parts, 1)
+  assert.deepEqual(data.backups, mediaPart.backup_url)
+  assert.match(data.command, /^yt-dlp /)
+})
+
+test('download proxy mode refuses files above the serverless response limit and explains why', async () => {
+  const route = downloadRoute({ biliWbiJson: async () => ({ durl: [mediaPart], quality: 64 }) })
+  const response = await route.POST(downloadRequest({})), data = await response.json()
+  assert.equal(response.status, 200)
+  assert.equal(data.mode, 'fallback')
+  assert.match(data.message, /超过网页中转上限 4 MiB/)
+  assert.equal(data.size, 19536124)
+})
+
+test('download route rejects multi-part and untrusted media addresses', async () => {
+  const multi = downloadRoute({ biliWbiJson: async () => ({ durl: [mediaPart, mediaPart], quality: 32 }) })
+  const multiData = await (await multi.POST(downloadRequest({}))).json()
+  assert.equal(multiData.mode, 'fallback')
+  assert.equal(multiData.parts, 2)
+
+  const untrusted = downloadRoute({ biliWbiJson: async () => ({ durl: [{ url: 'https://evil.test/video.mp4', size: 10 }] }) })
+  const untrustedData = await (await untrusted.POST(downloadRequest({}))).json()
+  assert.equal(untrustedData.mode, 'fallback')
+  assert.match(untrustedData.message, /受支持的视频地址/)
+})
+
+test('browser media lookup requests the selected part and validates CDN hosts', async () => {
+  const api = browserApi((script, window) => {
+    const request = new URL(script.src)
+    assert.equal(request.origin, 'https://api.bilibili.com')
+    assert.equal(request.pathname, '/x/player/playurl')
+    assert.equal(request.searchParams.get('cid'), '222')
+    assert.equal(request.searchParams.get('qn'), '64')
+    assert.equal(request.searchParams.get('platform'), 'html5')
+    queueMicrotask(() => window[request.searchParams.get('callback')]({ code: 0, data: {
+      quality: 64,
+      format: 'mp4720',
+      durl: [{ url: 'https://cn-hz-ct-01-01.bilivideo.com/video.mp4?x=1', size: 1024, backup_url: ['https://evil.test/video.mp4'] }],
+    } }))
+  })
+  const media = await api.browserMedia('BV1wD4y1o7AS', 222, 64, new AbortController().signal)
+  assert.deepEqual(media, {
+    url: 'https://cn-hz-ct-01-01.bilivideo.com/video.mp4?x=1',
+    backups: [],
+    size: 1024,
+    quality: 64,
+    parts: 1,
+    format: 'mp4720',
+  })
+  await assert.rejects(api.browserMedia('BV1wD4y1o7AS&cid=1', 222, 64, new AbortController().signal), /信息无效/)
+})
+
+test('accepts common Bilibili share variants: player embeds, bare domains, lowercase BV and trailing punctuation', () => {
+  assert.deepEqual(
+    parseVideoLink('https://player.bilibili.com/player.html?bvid=BV1GJ411x7h7&page=2'),
+    { platform: 'bilibili', bvid: 'BV1GJ411x7h7', page: 2, url: 'https://www.bilibili.com/video/BV1GJ411x7h7?p=2' },
+  )
+  assert.deepEqual(
+    parseVideoLink('https://player.bilibili.com/player.html?aid=80433022&page=3'),
+    { platform: 'bilibili', aid: '80433022', page: 3, url: 'https://www.bilibili.com/video/av80433022?p=3' },
+  )
+  assert.equal(parseVideoLink('bv1GJ411x7h7').bvid, 'BV1GJ411x7h7')
+  assert.equal(parseVideoLink('www.bilibili.com/video/BV1GJ411x7h7').page, 1)
+  assert.equal(parseVideoLink('bilibili.com/video/BV1GJ411x7h7?p=2').page, 2)
+  assert.equal(parseVideoLink('https://www.bilibili.com/video/BV1GJ411x7h7】').bvid, 'BV1GJ411x7h7')
+  assert.equal(parseVideoLink('https://www.bilibili.com/video/BV1GJ411x7h7?p=2复制此链接').page, 2)
+  assert.equal(parseVideoLink('【视频】https://www.bilibili.com/video/BV1GJ411x7h7?p=4 复制打开').page, 4)
+})
+
+test('explains which Bilibili page type is unsupported instead of a generic failure', () => {
+  for (const [link, expected] of [
+    ['https://www.bilibili.com/bangumi/play/ep123', /番剧\/影视/],
+    ['https://www.bilibili.com/cheese/play/ss123', /课堂\/课程/],
+    ['https://www.bilibili.com/list/123', /合集\/收藏夹/],
+    ['https://www.bilibili.com/read/cv123', /专栏\/动态/],
+    ['https://live.bilibili.com/123', /直播链接/],
+    ['https://space.bilibili.com/123', /UP 主空间/],
+    ['https://www.bilibili.com/video/BV1GJ411x7h', /视频地址不完整/],
+  ]) assert.throws(() => parseVideoLink(link), expected)
 })

@@ -9,6 +9,13 @@ const {
   automaticSourceCues,
   sourcePrompt,
   validTranscriptOffset,
+  normalizeFullSourceCues,
+  chunkSourceCues,
+  buildFullEvidence,
+  buildFullSectionEvidence,
+  readSourceCues,
+  cuesToSrt,
+  sourceCharacterCount,
 } = require(path.join(process.env.BILI_TEST_BUILD, "learning-source.js"));
 
 test("manual SRT retains real timing and stable source ids", () => {
@@ -151,6 +158,12 @@ function tutorialRoute({
   fetch = async () => {
     throw new Error("Unexpected AI request");
   },
+  biliWbiJson = async () => {
+    throw new Error("Unexpected Bilibili audio request");
+  },
+  biliJson = async () => {
+    throw new Error("Unexpected Bilibili plain API request");
+  },
   timers,
   logs = [],
 } = {}) {
@@ -174,13 +187,16 @@ function tutorialRoute({
       return {
         HttpError: MockHttpError,
         requestJson,
+        biliHeaders: {},
+        biliWbiJson,
+        biliJson,
         errorResponse: (error) =>
           Response.json(
             { error: error.message },
             { status: error.status || 500 },
           ),
       };
-    if (/\/lib\/(video-url|sse|learning-source)$/.test(name))
+    if (/\/lib\/(video-url|sse|learning-source|bili-metadata)$/.test(name))
       return require(
         path.join(process.env.BILI_TEST_BUILD, path.basename(name) + ".js"),
       );
@@ -218,6 +234,7 @@ async function routeEvents(post, body, signal = new AbortController().signal) {
   const text = await response.text();
   return {
     response,
+    raw: text,
     events: text
       .split("\n\n")
       .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
@@ -455,8 +472,8 @@ test("automatic connection and server failures use only the official alias witho
     } });
     const { events } = await routeEvents(post, {});
     assert.deepEqual(requests.map(request => new URL(request.url).origin), [
-      'https://bibigpt.co',
       'https://api.bibigpt.co',
+      'https://bibigpt.co',
     ]);
     for (const { url, options } of requests) {
       const endpoint = new URL(url);
@@ -464,6 +481,8 @@ test("automatic connection and server failures use only the official alias witho
       assert.equal(endpoint.searchParams.get('url'), 'https://www.bilibili.com/video/BV1wD4y1o7AS');
       assert.equal(options.redirect, 'error');
       assert.equal(options.headers.Authorization, 'Bearer test-token');
+      assert.equal(options.headers['x-client-type'], 'bibi-cli');
+      assert.equal(options.headers.Accept, 'application/json');
       assert.equal(options.method, 'GET');
       assert.equal(options.body, undefined);
     }
@@ -566,7 +585,7 @@ test("auto mode can recover an unavailable platform source with same-part direct
   });
   assert.equal(requests.length, 2);
   assert.equal(requests[0], 'https://aisubtitle.hdslb.com/test.json');
-  assert.equal(new URL(requests[1]).origin, 'https://bibigpt.co');
+  assert.equal(new URL(requests[1]).origin, 'https://api.bibigpt.co');
   assert.equal(new URL(requests[1]).pathname, '/api/v1/getSubtitle');
   assert.equal(events.find(event => event.evidence).evidence.kind, 'automatic');
   assert.ok(events.some(event => event.text));
@@ -683,4 +702,503 @@ test("a primary HTTP failure remains in safe logs when the alias later fails to 
     ['learning-source', { stage: 'automatic', classification: 'connection', videoId: 'BV1wD4y1o7AS' }],
   ]);
   assert.doesNotMatch(JSON.stringify(logs), /upstream-private-body|secret\.invalid|test-token/);
+});
+
+
+test("full source normalization splits long cues, keeps timing edges and stable global ids", () => {
+  const cues = normalizeFullSourceCues([
+    { id: "9", text: "甲".repeat(25000), start: 10, end: 70 },
+    { id: "7", text: "  乙  ", start: 80, end: 82 },
+    { id: "8", text: "   " },
+  ]);
+  assert.equal(cues.length, 7);
+  assert.deepEqual(cues.map(cue => cue.id), ["1", "2", "3", "4", "5", "6", "7"]);
+  assert.equal(cues[0].text.length, 4500);
+  assert.equal(cues[0].start, 10);
+  assert.equal(cues[0].end, undefined);
+  assert.equal(cues[5].text.length, 2500);
+  assert.equal(cues[5].start, undefined);
+  assert.equal(cues[5].end, 70);
+  assert.deepEqual(cues[6], { id: "7", text: "乙", start: 80, end: 82 });
+  assert.equal(sourceCharacterCount(cues), 25000 + 6 + 1);
+});
+
+test("full source chunks cover every cue exactly once and stay within the request bound", () => {
+  const source = normalizeFullSourceCues([
+    { id: "1", text: "第一段。".repeat(4000), start: 0, end: 30 },
+    { id: "2", text: "第二段。".repeat(4000), start: 30, end: 60 },
+    { id: "3", text: "最后一段。", start: 60, end: 61 },
+  ]);
+  const chunks = chunkSourceCues(source, 9000, 13000);
+  assert.ok(chunks.length > 1);
+  assert.deepEqual(chunks.flat().map(cue => cue.id), source.map(cue => cue.id));
+  assert.equal(
+    chunks.flat().map(cue => cue.text).join("\n"),
+    source.map(cue => cue.text).join("\n"),
+  );
+  for (const chunk of chunks) assert.ok(sourceCharacterCount(chunk) <= 13000);
+});
+
+test("full evidence keeps all cues and readSourceCues rejects malformed request data", () => {
+  const cues = [
+    { id: "1", text: "先安装。", start: 1, end: 2 },
+    { id: "2", text: "再运行。", start: 3, end: 4 },
+  ];
+  const evidence = buildFullEvidence(cues, "manual", "用户文本");
+  assert.equal(evidence.coverage, "full");
+  assert.equal(evidence.totalCharacters, sourceCharacterCount(cues));
+  assert.equal(evidence.analyzedCharacters, evidence.totalCharacters);
+  assert.deepEqual(evidence.cues, cues);
+  const section = buildFullSectionEvidence(cues, "manual", "用户文本", 2, 3);
+  assert.equal(section.coverage, "partial");
+  assert.match(section.limitation, /第 2\/3 段/);
+  assert.deepEqual(readSourceCues(cues), cues);
+  for (const bad of [
+    null,
+    {},
+    [{ id: "0", text: "坏 id" }],
+    [{ id: "1", text: "" }],
+    [{ id: "1", text: "甲" }, { id: "1", text: "乙" }],
+    [{ id: "1", text: "甲".repeat(30001) }],
+  ]) assert.throws(() => readSourceCues(bad));
+  assert.throws(() => buildFullEvidence([], "manual", "空"), /没有可分析/);
+});
+
+test("SRT export never invents timing for untimed source", () => {
+  assert.equal(cuesToSrt([{ id: "1", text: "无时间" }]), undefined);
+  assert.equal(cuesToSrt([{ id: "1", text: "只有开始时间", start: 1 }]), undefined);
+  const srt = cuesToSrt([
+    { id: "1", text: "第一段", start: 1.25, end: 3.5 },
+    { id: "2", text: "第二段", start: 62, end: 64 },
+  ]);
+  assert.match(srt, /00:00:01,250 --> 00:00:03,500\n第一段/);
+  assert.match(srt, /00:01:02,000 --> 00:01:04,000\n第二段/);
+});
+
+test("transcript mode returns every platform cue without calling the writing model", async () => {
+  let aiCalls = 0;
+  const post = tutorialRoute({
+    requestJson: async () => ({
+      body: [
+        { content: "第一段平台字幕。", from: 0, to: 2 },
+        { content: "第二段平台字幕。", from: 2, to: 4 },
+      ],
+    }),
+    fetch: async () => {
+      aiCalls++;
+      return modelResponse();
+    },
+  });
+  const { events } = await routeEvents(post, {
+    mode: "transcript",
+    subtitleUrl: "https://aisubtitle.hdslb.com/complete.json",
+    sourceMode: "subtitle",
+  });
+  const transcript = events.find(event => event.transcript).transcript;
+  assert.equal(transcript.kind, "subtitle");
+  assert.equal(transcript.coverage, "full");
+  assert.equal(transcript.cues.length, 2);
+  assert.equal(transcript.cues[1].text, "第二段平台字幕。");
+  assert.equal(transcript.totalCharacters, transcript.analyzedCharacters);
+  assert.ok(!events.some(event => event.text || event.error));
+  assert.equal(aiCalls, 0);
+});
+
+test("transcript mode refuses an automatic summary instead of presenting it as complete", async () => {
+  const post = tutorialRoute({
+    requestJson: async () => ({ success: true, summary: "## 摘要\n只有摘要。" }),
+  });
+  const { events } = await routeEvents(post, { mode: "transcript" });
+  assert.ok(!events.some(event => event.text || event.transcript));
+  assert.match(events.find(event => event.error).error, /只返回了摘要/);
+});
+
+test("full-section mode keeps global citation ids and uses the long-form prompt", async () => {
+  let sent;
+  const post = tutorialRoute({
+    requestJson: async () => {
+      throw new Error("full-section must not refetch a source");
+    },
+    fetch: async (_url, options) => {
+      sent = JSON.parse(options.body);
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"## 安装\\n安装解释器。[查看原文](source:7)"}}]}\n\ndata: [DONE]\n\n',
+        { headers: { "Content-Type": "text/event-stream" } },
+      );
+    },
+  });
+  const cues = [
+    { id: "7", text: "先下载 Python 安装包。", start: 1, end: 3 },
+    { id: "9", text: "再运行安装程序。", start: 3, end: 5 },
+  ];
+  const { events } = await routeEvents(post, {
+    mode: "full-section",
+    sourceCues: cues,
+    sourceKind: "manual",
+    sourceLabel: "用户提供的字幕",
+    sectionIndex: 2,
+    sectionTotal: 3,
+  });
+  assert.ok(events.some(event => event.text?.includes("source:7")));
+  const evidence = events.find(event => event.evidence).evidence;
+  assert.equal(evidence.coverage, "partial");
+  assert.match(evidence.limitation, /第 2\/3 段/);
+  assert.deepEqual(evidence.cues, cues);
+  assert.equal(sent.max_tokens, 8192);
+  assert.match(sent.messages[0].content, /不是写摘要/);
+  assert.match(sent.messages[0].content, /没有固定字数目标/);
+  assert.doesNotMatch(sent.messages[0].content, /1200|2500/);
+  assert.match(sent.messages.at(-1).content, /第 2\/3 段/);
+  assert.match(sent.messages.at(-1).content, /"id":"7"/);
+  assert.doesNotMatch(sent.messages.at(-1).content, /"id":1[^0-9]/);
+});
+
+test("full-section mode rejects invalid sections and cue data before any model call", async () => {
+  let calls = 0;
+  const post = tutorialRoute({
+    requestJson: async () => { calls++; return {}; },
+    fetch: async () => { calls++; return modelResponse(); },
+  });
+  const request = body => post({
+    json: async () => ({
+      videoUrl: "https://www.bilibili.com/video/BV1wD4y1o7AS",
+      title: "课程",
+      mode: "full-section",
+      sourceKind: "manual",
+      sourceLabel: "字幕",
+      sectionIndex: 1,
+      sectionTotal: 2,
+      sourceCues: [{ id: "1", text: "有效原文。" }],
+      ...body,
+    }),
+    signal: new AbortController().signal,
+  });
+  for (const body of [
+    { sectionIndex: 0 },
+    { sectionTotal: 0 },
+    { sectionIndex: 3 },
+    { sourceKind: "unknown" },
+    { sourceCues: [{ id: "0", text: "坏 id" }] },
+    { sourceCues: [] },
+  ]) {
+    const response = await request(body);
+    assert.equal(response.status, 400);
+    assert.ok((await response.json()).error);
+  }
+  assert.equal(calls, 0);
+});
+
+function audioMetadata(cid = 42, page = 1, duration = 120) {
+  return {
+    bvid: "BV1wD4y1o7AS", aid: 1, cid: page === 1 ? cid : 11,
+    title: "音频验收", desc: "", pic: "", duration,
+    pages: [{ cid, page, part: `第${page}节`, duration }],
+  };
+}
+
+test("audio fallback transcribes the selected part when the subtitle provider fails", async () => {
+  const requests = [], sent = [];
+  const post = tutorialRoute({
+    biliJson: async () => audioMetadata(42929948703),
+    requestJson: async (url, options) => {
+      requests.push({ url, options });
+      if (url.includes("/getSubtitle"))
+        throw new MockHttpError("视频 AI 服务暂时无法访问（500），请稍后重试。");
+      if (url.includes("/audio/transcriptions"))
+        return { text: "这是音频转写得到的实际内容。第二句话用于核对整理结果。" };
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    fetch: async (url, options) => {
+      if (String(url).includes("bilivideo.com"))
+        return new Response(new Uint8Array(2048), {
+          headers: { "Content-Type": "video/mp4", "Content-Length": "2048" },
+        });
+      sent.push(JSON.parse(options.body));
+      return modelResponse();
+    },
+    biliWbiJson: async (endpoint, parameters) => {
+      assert.equal(endpoint, "/x/player/wbi/playurl");
+      assert.equal(parameters.cid, 42929948703);
+      assert.equal(parameters.platform, "pc");
+      assert.equal(parameters.fnval, 16);
+      return {
+        dash: {
+          audio: [
+            { baseUrl: "https://cn-hz-ct-01-01.bilivideo.com/audio-high.m4s", bandwidth: 90788 },
+            { baseUrl: "https://cn-hz-ct-01-01.bilivideo.com/audio-low.m4s", bandwidth: 65681 },
+          ],
+        },
+      };
+    },
+  });
+  const { events } = await routeEvents(post, { cid: 42929948703 });
+  const evidence = events.find(event => event.evidence).evidence;
+  assert.equal(evidence.kind, "automatic");
+  assert.equal(evidence.label, "音频转写（SiliconFlow）");
+  assert.ok(evidence.cues.length >= 1);
+  assert.match(evidence.cues[0].text, /音频转写/);
+  assert.ok(events.some(event => event.status?.includes("音频")));
+  assert.ok(events.some(event => event.text));
+  const asr = requests.find(request => request.url.includes("/audio/transcriptions"));
+  assert.ok(asr);
+  assert.equal(asr.options.method, "POST");
+  assert.equal(asr.options.headers.Authorization, "Bearer test-token");
+  assert.ok(asr.options.body instanceof FormData);
+  assert.equal(asr.options.body.get("model"), "FunAudioLLM/SenseVoiceSmall");
+  assert.equal(asr.options.body.get("file").size, 2048);
+  assert.match(sent.at(-1).messages.at(-1).content, /音频转写得到的实际内容/);
+  assert.ok(!events.some(event => event.error));
+});
+
+test("audio fallback can transcribe a later part without using the first part's provider", async () => {
+  let bibigptCalls = 0, audioParameters;
+  const post = tutorialRoute({
+    biliJson: async () => audioMetadata(222, 2),
+    requestJson: async (url) => {
+      if (url.includes("/getSubtitle")) {
+        bibigptCalls++;
+        throw new MockHttpError("视频 AI 服务暂时无法访问（500），请稍后重试。");
+      }
+      if (url.includes("/audio/transcriptions"))
+        return { text: "第二 P 的音频转写内容，不会混入第一 P。" };
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    fetch: async (url) => {
+      if (String(url).includes("bilivideo.com"))
+        return new Response(new Uint8Array(128), {
+          headers: { "Content-Type": "video/mp4" },
+        });
+      return modelResponse();
+    },
+    biliWbiJson: async (_endpoint, parameters) => {
+      audioParameters = parameters;
+      return { dash: { audio: [
+        { baseUrl: "https://cn-hz-ct-01-01.bilivideo.com/p2.m4s", bandwidth: 65681 },
+      ] } };
+    },
+  });
+  const { events } = await routeEvents(post, {
+    videoUrl: "https://www.bilibili.com/video/BV1wD4y1o7AS?p=2",
+    cid: 222,
+  });
+  assert.equal(bibigptCalls, 0);
+  assert.equal(audioParameters.cid, 222);
+  const evidence = events.find(event => event.evidence).evidence;
+  assert.equal(evidence.kind, "automatic");
+  assert.match(evidence.cues[0].text, /第二 P/);
+  assert.ok(events.some(event => event.text));
+  assert.ok(!events.some(event => event.error));
+});
+
+const fullSectionBody = {
+  mode: "full-section", sourceKind: "manual", sourceLabel: "核对材料",
+  sectionIndex: 1, sectionTotal: 1,
+  sourceCues: [{ id: "1", text: "先运行 npm install，再运行 npm run build。" }],
+};
+
+test("full writing refuses an EOF-truncated model stream and does not bless it with DONE", async () => {
+  const post = tutorialRoute({ fetch: async () => new Response(
+    'data: {"choices":[{"delta":{"content":"## 尚未完成\\n只写到这里"}}]}\n\n',
+    { headers: { "Content-Type": "text/event-stream" } },
+  ) });
+  const { events, raw } = await routeEvents(post, fullSectionBody);
+  assert.ok(events.some(event => event.text));
+  assert.match(events.find(event => event.error).error, /连接中断/);
+  assert.doesNotMatch(raw, /data: \[DONE\]/);
+});
+
+test("full writing refuses length-limited output even after upstream DONE", async () => {
+  const post = tutorialRoute({ fetch: async () => new Response(
+    'data: {"choices":[{"delta":{"content":"## 只完成前半"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n',
+    { headers: { "Content-Type": "text/event-stream" } },
+  ) });
+  const { events, raw } = await routeEvents(post, fullSectionBody);
+  assert.ok(events.some(event => event.warning));
+  assert.match(events.find(event => event.error).error, /尚未整理完整/);
+  assert.doesNotMatch(raw, /data: \[DONE\]/);
+});
+
+test("a normal stop finish reason is sufficient when the provider omits its DONE frame", async () => {
+  const post = tutorialRoute({ fetch: async () => new Response(
+    'data: {"choices":[{"delta":{"content":"## 安装\\n运行 npm install。[查看原文](source:1)"},"finish_reason":"stop"}]}\n\n',
+    { headers: { "Content-Type": "text/event-stream" } },
+  ) });
+  const { events, raw } = await routeEvents(post, fullSectionBody);
+  assert.ok(!events.some(event => event.error));
+  assert.match(raw, /data: \[DONE\]/);
+});
+
+test("default full chunks leave sufficient output room and preserve every source character", () => {
+  const normalized = normalizeFullSourceCues([{ id: "91", text: "实质说明与命令npm run build。".repeat(1300) }]);
+  const chunks = chunkSourceCues(normalized);
+  assert.ok(chunks.length > 3);
+  for (const chunk of chunks) assert.ok(sourceCharacterCount(chunk) <= 4500);
+  assert.equal(chunks.flat().map(cue => cue.text).join(""), "实质说明与命令npm run build。".repeat(1300));
+});
+
+const audioPartBody = {
+  mode: "transcript", videoUrl: "https://www.bilibili.com/video/BV1wD4y1o7AS?p=2", cid: 42,
+};
+const audioPlay = { dash: { audio: [
+  { baseUrl: "https://cn-hz-ct-01-01.bilivideo.com/p2.m4s", bandwidth: 64000 },
+] } };
+
+test("audio fallback rejects a cid from another part and an over-hour part before downloading", async () => {
+  for (const metadata of [audioMetadata(11, 2), audioMetadata(42, 2, 3601)]) {
+    let downstream = 0;
+    const post = tutorialRoute({
+      biliJson: async () => metadata,
+      biliWbiJson: async () => { downstream++; return audioPlay; },
+      fetch: async () => { downstream++; return new Response("bad"); },
+      requestJson: async () => { downstream++; return {}; },
+    });
+    const { events } = await routeEvents(post, audioPartBody);
+    assert.match(events.find(event => event.error).error, /不一致|60 分钟/);
+    assert.equal(downstream, 0);
+  }
+});
+
+test("audio fallback rejects an incomplete Content-Length body before ASR", async () => {
+  let asr = 0;
+  const post = tutorialRoute({
+    biliJson: async () => audioMetadata(42, 2),
+    biliWbiJson: async () => audioPlay,
+    fetch: async () => new Response(new Uint8Array(8), { headers: { "Content-Type": "audio/mp4", "Content-Length": "16" } }),
+    requestJson: async () => { asr++; return { text: "不应转写" }; },
+  });
+  const { events } = await routeEvents(post, audioPartBody);
+  assert.match(events.find(event => event.error).error, /音频下载不完整/);
+  assert.equal(asr, 0);
+});
+
+test("audio fallback bounds a body without Content-Length and cancels at 50 MiB", async () => {
+  let asr = 0, canceled = false, sent = 0;
+  const post = tutorialRoute({
+    biliJson: async () => audioMetadata(42, 2),
+    biliWbiJson: async () => audioPlay,
+    fetch: async () => new Response(new ReadableStream({
+      pull(controller) {
+        if (sent++ < 2) controller.enqueue(new Uint8Array(26 * 1024 * 1024));
+      },
+      cancel() { canceled = true; },
+    }), { headers: { "Content-Type": "audio/mp4" } }),
+    requestJson: async () => { asr++; return { text: "不应转写" }; },
+  });
+  const { events } = await routeEvents(post, audioPartBody);
+  assert.match(events.find(event => event.error).error, /50 MB/);
+  assert.equal(asr, 0);
+  assert.equal(canceled, true);
+});
+
+test("audio download deadline remains active after headers and cancels a stalled body", async () => {
+  const timers = controlledTimers();
+  let fetching;
+  const fetched = new Promise(resolve => { fetching = resolve; });
+  let canceled = false, asr = 0;
+  const post = tutorialRoute({
+    timers,
+    biliJson: async () => audioMetadata(42, 2),
+    biliWbiJson: async () => audioPlay,
+    fetch: async () => {
+      fetching();
+      return new Response(new ReadableStream({ cancel() { canceled = true; } }), { headers: { "Content-Type": "audio/mp4" } });
+    },
+    requestJson: async () => { asr++; return { text: "不应转写" }; },
+  });
+  const pending = routeEvents(post, audioPartBody);
+  await fetched;
+  await Promise.resolve();
+  assert.ok(timers.pending().includes(30000));
+  timers.fire(30000);
+  const { events } = await pending;
+  assert.match(events.find(event => event.error).error, /音频下载超时/);
+  assert.equal(canceled, true);
+  assert.equal(asr, 0);
+  assert.deepEqual(timers.pending(), []);
+  assert.deepEqual(timers.pendingIntervals(), []);
+});
+
+test("audio fallback refuses a partial HTTP response instead of transcribing a fragment", async () => {
+  let asr = 0;
+  const post = tutorialRoute({
+    biliJson: async () => audioMetadata(42, 2),
+    biliWbiJson: async () => audioPlay,
+    fetch: async () => new Response(new Uint8Array(8), { status: 206, headers: {
+      "Content-Type": "audio/mp4", "Content-Length": "8", "Content-Range": "bytes 0-7/1000",
+    } }),
+    requestJson: async () => { asr++; return { text: "不应转写" }; },
+  });
+  const { events } = await routeEvents(post, audioPartBody);
+  assert.match(events.find(event => event.error).error, /音频下载不完整/);
+  assert.equal(asr, 0);
+});
+
+test("audio identity verification can use the official pagelist after the view endpoint fails", async () => {
+  const reads = [], logs = [];
+  const post = tutorialRoute({
+    logs,
+    biliJson: async path => {
+      reads.push(path);
+      if (path.startsWith("/x/web-interface/view"))
+        throw new MockHttpError("B 站暂时无法访问（412），请稍后重试。");
+      if (path.startsWith("/x/player/pagelist"))
+        return [
+          { page: 1, cid: 11, duration: 100 },
+          { page: 2, cid: 42, duration: 453 },
+        ];
+      throw new Error("Unexpected plain API");
+    },
+    biliWbiJson: async (_path, parameters) => {
+      assert.equal(parameters.cid, 42);
+      return audioPlay;
+    },
+    fetch: async () => new Response(new Uint8Array(8), { headers: { "Content-Type": "audio/mp4", "Content-Length": "8" } }),
+    requestJson: async () => ({ text: "官方分 P 信息核验后的真实音频转写文字。" }),
+  });
+  const { events } = await routeEvents(post, audioPartBody);
+  assert.deepEqual(reads, ["/x/web-interface/view?bvid=BV1wD4y1o7AS", "/x/player/pagelist?bvid=BV1wD4y1o7AS"]);
+  assert.ok(events.some(event => event.transcript?.cues?.[0]?.text.includes("真实音频")));
+  assert.ok(!events.some(event => event.error));
+  assert.ok(logs.some(([, detail]) => detail.stage === "audio-metadata-view" && detail.httpStatus === 412));
+});
+
+test("pagelist fallback still rejects a wrong cid, absent part or over-hour duration before audio fetch", async () => {
+  for (const pages of [
+    [{ page: 2, cid: 99, duration: 120 }],
+    [{ page: 1, cid: 42, duration: 120 }],
+    [{ page: 2, cid: 42, duration: 3601 }],
+  ]) {
+    let downstream = 0;
+    const post = tutorialRoute({
+      biliJson: async path => {
+        if (path.startsWith("/x/web-interface/view")) throw new MockHttpError("B 站暂时无法访问（412），请稍后重试。");
+        return pages;
+      },
+      biliWbiJson: async () => { downstream++; return audioPlay; },
+      fetch: async () => { downstream++; return new Response("bad"); },
+    });
+    const { events } = await routeEvents(post, audioPartBody);
+    assert.match(events.find(event => event.error).error, /不一致|无法核对|60 分钟/);
+    assert.equal(downstream, 0);
+  }
+});
+
+test("metadata and playurl failures are identified as platform audio stages, not ASR failures", async () => {
+  for (const stage of ["metadata", "playurl"]) {
+    const logs = [];
+    const post = tutorialRoute({
+      logs,
+      biliJson: async path => {
+        if (stage === "playurl" && path.startsWith("/x/web-interface/view")) return audioMetadata(42, 2);
+        throw new MockHttpError("B 站暂时无法访问（412），请稍后重试。");
+      },
+      biliWbiJson: async () => { throw new MockHttpError("B 站暂时无法访问（412），请稍后重试。"); },
+    });
+    const { events } = await routeEvents(post, audioPartBody);
+    const error = events.find(event => event.error).error;
+    assert.match(error, stage === "metadata" ? /身份核验读取失败（412）/ : /播放信息读取失败（412）/);
+    assert.doesNotMatch(error, /音频转写服务访问失败/);
+    assert.ok(logs.some(([, detail]) => detail.stage === (stage === "metadata" ? "audio-metadata-pagelist" : "audio-playurl-plain") && detail.httpStatus === 412));
+    assert.doesNotMatch(JSON.stringify(logs), /test-token|Authorization/);
+  }
 });

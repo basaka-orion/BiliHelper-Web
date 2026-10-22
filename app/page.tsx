@@ -38,10 +38,22 @@ import {
 } from "../lib/workspace";
 import { useWorkspace } from "../lib/use-workspace";
 import {
+  buildFullEvidence,
+  chunkSourceCues,
+  cuesToPlainText,
+  cuesToSrt,
+  normalizeFullSourceCues,
   parseTranscript,
+  sourceCharacterCount,
   type SourceCue,
   type SourceEvidence,
 } from "../lib/learning-source";
+import {
+  assembleFullDocument,
+  assemblePartialDocument,
+  markdownFileName,
+  type FullDocumentSection,
+} from "../lib/full-document";
 import { Modal } from "./components/modal";
 import { DownloadPanel } from "./components/download-panel";
 
@@ -49,6 +61,9 @@ const EXAMPLE = "https://www.bilibili.com/video/BV1wD4y1o7AS";
 function duration(seconds = 0) {
   const minutes = Math.floor(seconds / 60);
   return `${minutes}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
+}
+function fileBaseName(title: string) {
+  return title.replace(/[\\/:*?"<>|]/g, "_").slice(0, 120) || "视频";
 }
 function partName(video: VideoInfo) {
   return (
@@ -65,7 +80,9 @@ function noteState(document?: LearningDocument) {
     : document?.draft?.text || document?.generationState === "interrupted"
       ? "未完成"
       : document?.note
-        ? "有笔记"
+        ? document.note.mode === "full"
+          ? "完整文档"
+          : "有笔记"
         : "未整理";
 }
 function coverage(evidence?: SourceEvidence) {
@@ -78,8 +95,21 @@ function coverage(evidence?: SourceEvidence) {
 function cueUrl(video: VideoInfo, cue: SourceCue) {
   const url = new URL(video.url);
   if (cue.start !== undefined)
-    url.searchParams.set("t", String(Math.floor(cue.start)));
+    url.searchParams.set(
+      "t",
+      video.platform === "youtube"
+        ? `${Math.floor(cue.start)}s`
+        : String(Math.floor(cue.start)),
+    );
   return url.href;
+}
+function saveTextFile(text: string, name: string, type = "text/markdown;charset=utf-8") {
+  const href = URL.createObjectURL(new Blob([text], { type })),
+    link = window.document.createElement("a");
+  link.href = href;
+  link.download = name;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(href), 10000);
 }
 async function json(response: Response) {
   const data = await response.json().catch(() => {
@@ -124,10 +154,17 @@ export default function Home() {
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState("");
   const [deleted, setDeleted] = useState<LearningDocument>();
-  const [job, setJob] = useState<{ id: string; status: string } | null>(null);
-  const jobRef = useRef<{ id: string; controller: AbortController } | null>(
-    null,
-  );
+  const [job, setJob] = useState<{
+    id: string;
+    status: string;
+    done?: number;
+    total?: number;
+  } | null>(null);
+  const jobRef = useRef<{
+    id: string;
+    controller: AbortController;
+    mode?: "study" | "full";
+  } | null>(null);
   const analyzeRef = useRef<AbortController>();
   const contentRef = useRef<HTMLElement>(null);
   const restoreScroll = useRef(false);
@@ -150,12 +187,15 @@ export default function Home() {
         ? active.draft
         : active.note
     : undefined;
-  const generationError = active?.draft?.error;
+  const generationError = active?.draft?.error || active?.fullJob?.error;
+  const noteMode = active?.noteMode || "full";
+  const fullSections = active?.fullJob?.sections || [];
+  const canResumeFull = noteMode === "full" && !!active?.fullJob;
   const needsSource =
     !!active &&
     !active.transcript.trim() &&
     !active.video.subtitles.length &&
-    (active.video.selectedPage || 1) > 1;
+    !["bilibili", "youtube"].includes(active.video.platform);
   const manualCharacters = useMemo(
     () =>
       parseTranscript(active?.transcript || "")
@@ -164,15 +204,22 @@ export default function Home() {
     [active?.transcript],
   );
   const currentEvidence = active?.draft?.evidence || active?.note?.evidence;
-  const totalCharacters = active?.transcript.trim()
-    ? manualCharacters
-    : currentEvidence?.kind !== "manual"
-      ? currentEvidence?.totalCharacters || 0
-      : 0;
-  const sourceCues = shownNote?.evidence?.cues || [];
+  const totalCharacters =
+    active?.fullJob?.totalCharacters ||
+    (active?.transcript.trim()
+      ? manualCharacters
+      : currentEvidence?.kind !== "manual"
+        ? currentEvidence?.totalCharacters || 0
+        : 0);
+  const sourceCues =
+    shownNote?.evidence?.cues?.length
+      ? shownNote.evidence.cues
+      : active?.fullJob?.source.cues || [];
   const matchingCues = sourceCues.filter(
     (cue) => !sourceSearch || cue.text.includes(sourceSearch),
   );
+  const visibleCues = matchingCues.slice(0, 2000);
+  const sourceSrt = useMemo(() => cuesToSrt(sourceCues), [sourceCues]);
   const focusCue = sourceCues.find((cue) => cue.id === selectedCue);
 
   useEffect(() => {
@@ -254,14 +301,8 @@ export default function Home() {
         return;
       }
       let video: VideoInfo | undefined;
-      if (link.platform === "bilibili" && !link.short) {
-        try {
-          video = await browserVideoInfo(link.url, controller.signal);
-        } catch {
-          if (controller.signal.aborted) return;
-        }
-      }
-      if (!video) {
+      let serverError: unknown;
+      try {
         const response = await fetch("/api/video-info", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -271,14 +312,20 @@ export default function Home() {
         const data = await response.json().catch(() => {
           throw new Error("视频服务暂不可用，请重试。");
         });
-        if (!response.ok) {
-          if (data.browserFallback)
-            video = await browserVideoInfo(
-              data.resolvedUrl || value,
-              controller.signal,
-            );
-          else throw new Error(data.error || "视频无法打开");
-        } else video = data;
+        if (response.ok) video = data;
+        else throw new Error(data.error || "视频无法打开");
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        serverError = error;
+        // Browser JSONP is a fallback for networks where the cloud API is blocked.
+        if (link.platform === "bilibili" && !link.short) {
+          try {
+            video = await browserVideoInfo(link.url, controller.signal);
+          } catch (browserError) {
+            if (controller.signal.aborted) return;
+            throw serverError instanceof Error ? serverError : browserError;
+          }
+        } else throw error;
       }
       if (controller.signal.aborted || !video) return;
       let metadata = video;
@@ -347,6 +394,478 @@ export default function Home() {
     }
   }
 
+
+  function partialFullDocument(
+    snapshot: LearningDocument,
+    source: SourceEvidence,
+    sections: FullDocumentSection[],
+    live?: FullDocumentSection,
+  ) {
+    const all = (live ? [...sections, live] : sections)
+      .filter((section) => section.markdown.trim())
+      .sort((a, b) => a.index - b.index);
+    if (!all.length) return "";
+    return assemblePartialDocument({
+      title: snapshot.video.title,
+      partTitle: partName(snapshot.video),
+      videoUrl: snapshot.video.url,
+      sourceLabel: source.label,
+      totalCharacters:
+        source.totalCharacters || sourceCharacterCount(source.cues),
+      sections: all,
+      generatedAt: Date.now(),
+      platform: snapshot.video.platform,
+      page: snapshot.video.selectedPage || 1,
+      pageCount: snapshot.video.pages?.length || 1,
+    });
+  }
+
+  async function acquireFullSource(
+    snapshot: LearningDocument,
+    id: string,
+    controller: AbortController,
+  ): Promise<SourceEvidence> {
+    if (snapshot.transcript.trim()) {
+      const cues = normalizeFullSourceCues(parseTranscript(snapshot.transcript));
+      if (sourceCharacterCount(cues) < 30)
+        throw new Error("字幕文本太短，请粘贴至少 30 个字符的实际视频内容。");
+      return buildFullEvidence(cues, "manual", "你提供的字幕文本");
+    }
+    let sourceVideo = snapshot.video;
+    let subtitleIndex = snapshot.subtitleIndex;
+    if (sourceVideo.platform === "bilibili") {
+      setJob({ id, status: "正在重新检查本节字幕…" });
+      const refreshed = await refreshVideoSource(
+        sourceVideo,
+        subtitleIndex,
+        controller.signal,
+        browserSubtitles,
+        async (url, signal) =>
+          json(
+            await fetch("/api/video-info", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              signal,
+              body: JSON.stringify({ url }),
+            }),
+          ),
+        snapshot.video.subtitles[Number(snapshot.subtitleIndex)]?.lan,
+      );
+      sourceVideo = refreshed.video;
+      subtitleIndex = refreshed.selected;
+      if (snapshot.subtitleIndex !== "auto" && subtitleIndex === "auto")
+        setNotice("原先选择的字幕已不可用，已切换为自动读取本节内容。");
+      updateDocument(id, (value) => ({
+        ...value,
+        video: sourceVideo,
+        subtitleIndex,
+      }));
+    }
+    const subtitle =
+      subtitleIndex === "auto"
+        ? sourceVideo.subtitles[0]
+        : sourceVideo.subtitles[Number(subtitleIndex)];
+    setJob({ id, status: "正在读取本节全部字幕与时间码…" });
+    const response = await fetch("/api/tutorial", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        mode: "transcript",
+        videoUrl: sourceVideo.url,
+        title: `${snapshot.video.title} · P${snapshot.video.selectedPage || 1} ${partName(snapshot.video)}`,
+        transcript: "",
+        transcriptOffset: 0,
+        cid: sourceVideo.cid,
+        subtitleUrl: subtitle?.subtitle_url || "",
+        sourceMode: subtitleIndex === "auto" ? "auto" : "subtitle",
+      }),
+    });
+    if (!response.ok) {
+      await json(response);
+      throw new Error("无法读取本节完整字幕，请重试。");
+    }
+    if (
+      !response.body ||
+      !response.headers.get("content-type")?.includes("text/event-stream")
+    )
+      throw new Error("字幕读取服务返回格式异常，请重试。");
+    let transcript: SourceEvidence | undefined;
+    let completed = false;
+    await readSSE(response.body, (payload) => {
+      if (controller.signal.aborted) return;
+      if (payload === "[DONE]") {
+        completed = true;
+        return;
+      }
+      let event;
+      try {
+        event = JSON.parse(payload);
+      } catch {
+        return;
+      }
+      if (event.error) throw new Error(event.error);
+      if (event.status) setJob({ id, status: event.status });
+      if (event.transcript) transcript = event.transcript as SourceEvidence;
+    });
+    if (!completed || !transcript?.cues?.length)
+      throw new Error(
+        "没有取得可核对的完整原文。请刷新来源，或在「来源与视频信息」中粘贴这一节的实际字幕后重试。",
+      );
+    const cues = normalizeFullSourceCues(transcript.cues);
+    return buildFullEvidence(cues, transcript.kind, transcript.label);
+  }
+
+  async function requestFullSection(
+    snapshot: LearningDocument,
+    source: SourceEvidence,
+    chunk: SourceCue[],
+    index: number,
+    total: number,
+    controller: AbortController,
+    onText: (text: string) => void,
+  ) {
+    setJob({
+      id: snapshot.id,
+      status: `正在整理第 ${index + 1}/${total} 段…`,
+      done: index,
+      total,
+    });
+    const response = await fetch("/api/tutorial", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        mode: "full-section",
+        videoUrl: snapshot.video.url,
+        title: `${snapshot.video.title} · P${snapshot.video.selectedPage || 1} ${partName(snapshot.video)}`,
+        sourceCues: chunk,
+        sourceKind: source.kind,
+        sourceLabel: source.label,
+        sectionIndex: index + 1,
+        sectionTotal: total,
+        transcriptOffset: 0,
+        cid: snapshot.video.cid,
+      }),
+    });
+    if (!response.ok) {
+      await json(response);
+      throw new Error(`第 ${index + 1} 段整理失败，请重试。`);
+    }
+    if (
+      !response.body ||
+      !response.headers.get("content-type")?.includes("text/event-stream")
+    )
+      throw new Error("整理服务返回格式异常，请重试。");
+    let output = "";
+    let warning = "";
+    let completed = false;
+    await readSSE(response.body, (payload) => {
+      if (controller.signal.aborted) return;
+      if (payload === "[DONE]") {
+        completed = true;
+        return;
+      }
+      let event;
+      try {
+        event = JSON.parse(payload);
+      } catch {
+        return;
+      }
+      if (event.error) throw new Error(event.error);
+      if (event.warning) warning = event.warning;
+      if (event.status)
+        setJob({
+          id: snapshot.id,
+          status: event.status,
+          done: index,
+          total,
+        });
+      if (event.text) {
+        output += event.text;
+        onText(event.text);
+      }
+    });
+    if (warning)
+      throw new Error(
+        `第 ${index + 1} 段未完成：${warning} 已完成的其他段落会保留，可继续重试这一段。`,
+      );
+    if (!completed || !output.trim())
+      throw new Error(`第 ${index + 1} 段没有返回内容，请重试。`);
+    return { text: output, warning };
+  }
+
+  async function generateFull(resume = false) {
+    if (!active || jobRef.current) return;
+    if (needsSource && !(resume && active.fullJob?.source)) {
+      setSourceOpen(true);
+      return;
+    }
+    const snapshot = active,
+      id = active.id,
+      controller = new AbortController();
+    jobRef.current = { id, controller, mode: "full" };
+    setShowPrevious(false);
+    const startedAt = snapshot.fullJob?.startedAt || Date.now();
+    let source = resume ? snapshot.fullJob?.source : undefined;
+    let sections: FullDocumentSection[] = resume
+      ? [...(snapshot.fullJob?.sections || [])]
+      : [];
+    let chunks: SourceCue[][] = [];
+    let totalSections = resume ? snapshot.fullJob?.totalSections || 0 : 0;
+    let unfinishedSection: FullDocumentSection | undefined;
+    setJob({
+      id,
+      status: resume ? "继续完整整理…" : "准备完整整理…",
+      done: sections.length,
+      total: totalSections,
+    });
+    try {
+      if (!resume || !source) {
+        updateDocument(id, (value) => ({
+          ...value,
+          noteMode: "full",
+          generationState: "running",
+          note:
+            value.note ||
+            (value.draft?.text
+              ? {
+                  ...value.draft,
+                  evidence: value.draft.evidence || value.fullJob?.source,
+                }
+              : undefined),
+          fullJob: undefined,
+          draft: {
+            text: "",
+            source: "",
+            status: "partial",
+            generatedAt: startedAt,
+            mode: "full",
+            sectionCount: 0,
+          },
+        }));
+        source = await acquireFullSource(snapshot, id, controller);
+        chunks = chunkSourceCues(source.cues);
+        totalSections = chunks.length;
+        if (totalSections > 10)
+          setNotice(
+            `本节字幕较长，将分 ${totalSections} 段整理。请保持页面打开；中断后可以继续整理。`,
+          );
+        updateDocument(id, (value) => ({
+          ...value,
+          noteMode: "full",
+          generationState: "running",
+          fullJob: {
+            status: "running",
+            source: source!,
+            totalCharacters:
+              source!.totalCharacters || sourceCharacterCount(source!.cues),
+            totalSections,
+            sections: [],
+            startedAt,
+            updatedAt: Date.now(),
+          },
+          draft: {
+            text: "",
+            source: source!.label,
+            status: "partial",
+            generatedAt: startedAt,
+            mode: "full",
+            sectionCount: 0,
+          },
+        }));
+      } else {
+        chunks = chunkSourceCues(source.cues);
+        if (chunks.length !== totalSections) {
+          totalSections = chunks.length;
+          sections = sections.filter((section) => section.index < totalSections);
+        }
+        updateDocument(id, (value) => ({
+          ...value,
+          noteMode: "full",
+          generationState: "running",
+          fullJob: value.fullJob
+            ? {
+                ...value.fullJob,
+                status: "running",
+                error: undefined,
+                totalSections,
+                sections,
+                updatedAt: Date.now(),
+              }
+            : undefined,
+          draft: {
+            text: partialFullDocument(snapshot, source!, sections),
+            source: source!.label,
+            status: "partial",
+            generatedAt: startedAt,
+            mode: "full",
+            sectionCount: sections.length,
+          },
+        }));
+      }
+      const fullSource = source;
+      if (!fullSource) throw new Error("没有取得可整理的原文，请重试。");
+      setJob({
+        id,
+        status: `共 ${totalSections} 段，开始整理…`,
+        done: sections.length,
+        total: totalSections,
+      });
+      for (let index = sections.length; index < chunks.length; index++) {
+        if (controller.signal.aborted) throw new Error("已停止");
+        let live = "";
+        let lastPaint = 0;
+        const section = await requestFullSection(
+          snapshot,
+          fullSource,
+          chunks[index],
+          index,
+          chunks.length,
+          controller,
+          (text) => {
+            live += text;
+            unfinishedSection = { index, markdown: live, cueIds: [] };
+            const now = Date.now();
+            if (now - lastPaint < 450) return;
+            lastPaint = now;
+            const preview = partialFullDocument(snapshot, fullSource, sections, {
+              index,
+              markdown: live,
+              cueIds: [],
+            });
+            updateDocument(id, (value) =>
+              value.draft
+                ? { ...value, draft: { ...value.draft, text: preview } }
+                : value,
+            );
+          },
+        );
+        sections = [
+          ...sections,
+          {
+            index,
+            markdown: section.text,
+            cueIds: chunks[index].map((cue) => cue.id),
+            ...(section.warning ? { warning: section.warning } : {}),
+          },
+        ];
+        unfinishedSection = undefined;
+        updateDocument(id, (value) => ({
+          ...value,
+          fullJob: {
+            status: "running",
+            source: fullSource,
+            totalCharacters:
+              fullSource.totalCharacters ||
+              sourceCharacterCount(fullSource.cues),
+            totalSections: chunks.length,
+            sections,
+            startedAt,
+            updatedAt: Date.now(),
+          },
+          draft: {
+            text: partialFullDocument(snapshot, fullSource, sections),
+            source: fullSource.label,
+            status: "partial",
+            generatedAt: startedAt,
+            mode: "full",
+            sectionCount: sections.length,
+          },
+        }));
+        setJob({
+          id,
+          status: `第 ${index + 1}/${chunks.length} 段已整理`,
+          done: index + 1,
+          total: chunks.length,
+        });
+      }
+      const warnings = sections
+        .filter((section) => section.warning)
+        .map((section) => `第 ${section.index + 1} 段：${section.warning}`);
+      const finalText = assembleFullDocument({
+        title: snapshot.video.title,
+        partTitle: partName(snapshot.video),
+        videoUrl: snapshot.video.url,
+        sourceLabel: fullSource.label,
+        totalCharacters:
+          fullSource.totalCharacters || sourceCharacterCount(fullSource.cues),
+        sections,
+        generatedAt: startedAt,
+        platform: snapshot.video.platform,
+        page: snapshot.video.selectedPage || 1,
+        pageCount: snapshot.video.pages?.length || 1,
+      });
+      const result: LearningNote = {
+        text: finalText,
+        source: fullSource.label,
+        evidence: buildFullEvidence(
+          fullSource.cues,
+          fullSource.kind,
+          fullSource.label,
+        ),
+        status: warnings.length ? "partial" : "complete",
+        error: warnings.length ? warnings.join("；") : undefined,
+        generatedAt: startedAt,
+        mode: "full",
+        sectionCount: sections.length,
+      };
+      updateDocument(id, (value) => ({
+        ...value,
+        note: result,
+        previousNote: value.note || value.previousNote,
+        draft: undefined,
+        fullJob: undefined,
+        generationState: "idle",
+        updatedAt: Date.now(),
+      }));
+      setNotice(`完整文档已整理完成：共 ${sections.length} 段。`);
+    } catch (error) {
+      const message = controller.signal.aborted
+        ? "完整整理已停止，已完成的部分已保存。"
+        : error instanceof Error
+          ? error.message
+          : "完整整理失败，请重试。";
+      const preview = source
+        ? partialFullDocument(snapshot, source, sections, unfinishedSection)
+        : sections.length
+          ? sections.map((section) => section.markdown).join("\n\n---\n\n")
+          : "";
+      updateDocument(id, (value) => ({
+        ...value,
+        generationState: "interrupted",
+        fullJob: source
+          ? {
+              status: controller.signal.aborted ? "paused" : "error",
+              source,
+              totalCharacters:
+                source.totalCharacters || sourceCharacterCount(source.cues),
+              totalSections: totalSections || chunks.length || 1,
+              sections,
+              error: message,
+              startedAt,
+              updatedAt: Date.now(),
+            }
+          : value.fullJob,
+        draft: {
+          text: preview,
+          source: source?.label || value.draft?.source || "",
+          status: "partial",
+          error: message,
+          generatedAt: startedAt,
+          mode: "full",
+          sectionCount: sections.length,
+        },
+      }));
+    } finally {
+      if (jobRef.current?.controller === controller) {
+        jobRef.current = null;
+        setJob(null);
+      }
+      flush();
+    }
+  }
+
   async function generate() {
     if (!active || jobRef.current || needsSource) return;
     if (active.transcript.trim() && active.transcript.trim().length < 30) {
@@ -357,7 +876,7 @@ export default function Home() {
     const snapshot = active,
       id = active.id,
       controller = new AbortController();
-    jobRef.current = { id, controller };
+    jobRef.current = { id, controller, mode: "study" };
     setJob({ id, status: "正在读取本节内容…" });
     setShowPrevious(false);
     let output = "",
@@ -368,14 +887,20 @@ export default function Home() {
     const generatedAt = Date.now();
     updateDocument(id, (value) => ({
       ...value,
+      noteMode: "study",
       generationState: "running",
+      fullJob: undefined,
       updatedAt: generatedAt,
       note: value.note || (value.draft?.text ? value.draft : undefined),
       draft: { text: "", source: "", status: "partial", generatedAt },
     }));
     contentRef.current?.focus({ preventScroll: true });
     const timeout = setTimeout(() => controller.abort(), 210000);
-    const storeDraft = (error?: string) =>
+    let lastDraftAt = 0;
+    const storeDraft = (error?: string) => {
+      const now = Date.now();
+      if (!error && now - lastDraftAt < 300) return;
+      lastDraftAt = now;
       updateDocument(id, (value) => ({
         ...value,
         draft: {
@@ -385,8 +910,10 @@ export default function Home() {
           status: "partial",
           error,
           generatedAt,
+          mode: "study",
         },
       }));
+    };
     try {
       let sourceVideo = snapshot.video,
         subtitleIndex = snapshot.subtitleIndex;
@@ -430,6 +957,7 @@ export default function Home() {
           title: `${snapshot.video.title} · P${snapshot.video.selectedPage || 1} ${partName(snapshot.video)}`,
           transcript: snapshot.transcript,
           transcriptOffset: snapshot.transcriptOffset,
+          cid: snapshot.video.cid,
           subtitleUrl: subtitle?.subtitle_url || "",
           sourceMode: subtitleIndex === "auto" ? "auto" : "subtitle",
         }),
@@ -472,6 +1000,7 @@ export default function Home() {
         status: warning ? "partial" : "complete",
         error: warning || undefined,
         generatedAt,
+        mode: "study",
       };
       updateDocument(id, (value) => ({
         ...value,
@@ -505,31 +1034,113 @@ export default function Home() {
   function exportNote(item = active, note = shownNote) {
     if (!item) return;
     const title = partName(item.video);
-    const cues = note?.evidence?.cues || [];
+    const full = note?.mode === "full";
+    const evidence = note?.evidence || item.fullJob?.source;
+    const cues = evidence?.cues || [];
     const markdown = tutorialMarkdown(note?.text || "").replace(
       /\[([^\]]+)\]\(source:(\d+)\)/g,
       (match, label, id) =>
-        cues.some((cue) => cue.id === id) ? `[${label}][^source-${id}]` : label,
+        cues.some((cue) => cue.id === id)
+          ? full
+            ? `（原文 ${id}）`
+            : `[${label}][^source-${id}]`
+          : label,
     );
     const references = cues.length
-      ? "\n\n## 来源原文\n\n" +
-        cues
-          .map(
-            (cue) =>
-              `[^source-${cue.id}]: ${cue.text.replace(/\n/g, "\n    ")}${cue.start !== undefined ? ` [回看 ${duration(cue.start)}](${cueUrl(item.video, cue)})` : ""}`,
-          )
-          .join("\n\n")
+      ? full
+        ? `\n\n## 附：完整字幕原文（可核对）\n\n` +
+          cues
+            .map((cue) => {
+              const time =
+                cue.start !== undefined ? `[${duration(cue.start)}] ` : "";
+              const link =
+                cue.start !== undefined
+                  ? ` [回看](${cueUrl(item.video, cue)})`
+                  : "";
+              return `- **原文 ${cue.id}** ${time}${cue.text.replace(/\n/g, "\n  ")}${link}`;
+            })
+            .join("\n\n")
+        : `\n\n## 来源原文\n\n` +
+          cues
+            .map((cue) => {
+              const time =
+                cue.start !== undefined ? `[${duration(cue.start)}] ` : "";
+              const link =
+                cue.start !== undefined
+                  ? ` [回看](${cueUrl(item.video, cue)})`
+                  : "";
+              return `[^source-${cue.id}]: ${time}${cue.text.replace(/\n/g, "\n    ")}${link}`;
+            })
+            .join("\n\n")
       : "";
-    const text = `# ${title}\n\n来源：${item.video.url}\n\n依据：${note?.source || "未生成"}\n覆盖：${coverage(note?.evidence)}\n${note?.evidence?.limitation ? `说明：${note.evidence.limitation}\n` : ""}${note?.status === "partial" || note?.error ? `\n注意：内容未完成。${note.error || ""}\n` : ""}\n${markdown}${references}\n\n## 我的备注\n\n${item.memo || "暂无备注"}\n${item.transcript ? `\n## 待整理的输入文本\n\n${item.transcript}\n` : ""}`;
-    const href = URL.createObjectURL(
-        new Blob([text], { type: "text/markdown;charset=utf-8" }),
-      ),
-      link = window.document.createElement("a");
-    link.href = href;
-    link.download = `${title.replace(/[\\/:*?"<>|]/g, "_")}-学习笔记.md`;
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(href), 10000);
+    const metadata = [
+      `来源：${item.video.url}`,
+      `依据：${note?.source || "未生成"}`,
+      `覆盖：${full && note?.status === "partial" ? "已取得原文，正文尚未全部整理" : coverage(evidence)}`,
+      full ? `整理方式：完整文档 · ${note?.sectionCount || 0} 段` : "整理方式：学习笔记",
+      note?.generatedAt
+        ? `生成时间：${new Date(note.generatedAt).toLocaleString("zh-CN")}`
+        : "",
+      evidence?.limitation ? `说明：${evidence.limitation}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const warning =
+      note?.status === "partial" || note?.error
+        ? `\n\n> 注意：内容未完成。${note.error || ""}\n`
+        : "";
+    const body =
+      full && markdown.trim().startsWith("# ")
+        ? markdown
+        : `# ${title}\n\n${markdown}`;
+    const text = `${body}\n\n> ${metadata.replace(/\n/g, "  \n> ")}\n${warning}${references}\n\n## 我的备注\n\n${item.memo || "暂无备注"}\n${
+      !full && item.transcript
+        ? `\n## 待整理的输入文本\n\n${item.transcript}\n`
+        : ""
+    }`;
+    saveTextFile(
+      text,
+      markdownFileName(title, full ? "完整文档" : "学习笔记"),
+    );
   }
+  function exportCourse(source = active || document) {
+    if (!source) return;
+    const pages = source.video.pages || [];
+    if (pages.length < 2) {
+      setNotice("当前是单节视频，直接导出这一节的完整文档即可。");
+      return;
+    }
+    const entries = pages.flatMap((part) => {
+      const item =
+        current.current.documents[documentId(partUrl(source.video, part.page))];
+      return item?.note ? [{ part, item, note: item.note }] : [];
+    });
+    if (!entries.length) {
+      setNotice("还没有已整理的章节。先把需要的章节整理出来，再合并导出。");
+      return;
+    }
+    const body = entries
+      .map(({ part, item, note }) => {
+        const markdown = tutorialMarkdown(note.text)
+          .replace(/^#\s+[^\n]*\n+/, "")
+          .replace(/\[([^\]]+)\]\(source:\d+\)/g, "$1");
+        const incomplete =
+          note.status === "partial"
+            ? `> 本节尚未完成：${note.error || "仅包含已保存的部分内容。"}\n\n`
+            : "";
+        return `## P${part.page} ${part.title}\n\n${incomplete}${markdown}\n\n> 依据：${note.source || "未标注"} · ${coverage(note.evidence)}${
+          item.memo ? `\n>\n> 我的备注：${item.memo}` : ""
+        }`;
+      })
+      .join("\n\n---\n\n");
+    const completed = entries.filter(({ note }) => note.status === "complete").length;
+    const text = `# ${source.video.title}\n\n> 课程合集 · 已保存 ${entries.length}/${pages.length} 节，其中 ${completed} 节已完成；未完成章节单独标注。\n> 原视频：${source.video.url}\n\n${body}\n`;
+    saveTextFile(
+      text,
+      markdownFileName(source.video.title, `已整理${entries.length}节`),
+    );
+  }
+
   async function copyNote() {
     try {
       await navigator.clipboard.writeText(
@@ -747,9 +1358,9 @@ export default function Home() {
                   留给下次的自己。
                 </h1>
                 <p className="landing-description">
-                  把教程整理成有依据的学习笔记。
+                  把教程整理成有依据的完整文档。
                   <br />
-                  找到重点，留下理解，下次回来继续。
+                  逐段覆盖全部字幕，留下理解，下次回来继续。
                 </p>
                 <form
                   className="import-form"
@@ -808,15 +1419,15 @@ export default function Home() {
                   </button>
                 )}
               </div>
-              <div className="note-preview" aria-label="笔记结构预览">
+              <div className="note-preview" aria-label="文档结构预览">
                 <div className="preview-top">
                   <span className="preview-dots">● ● ●</span>
-                  <span>笔记结构预览</span>
+                  <span>文档结构预览</span>
                 </div>
                 <div className="preview-page">
                   <div className="preview-label">
                     <FileText size={14} />
-                    每一节，都有自己的笔记
+                    每一节，都有自己的完整文档
                   </div>
                   <h2>
                     从看过，
@@ -830,15 +1441,15 @@ export default function Home() {
                   <div className="preview-section">
                     <span>01</span>
                     <div>
-                      <h3>本节要解决什么</h3>
-                      <p>先看清这节内容的目的。</p>
+                      <h3>全文脉络</h3>
+                      <p>按原文顺序整理全部内容。</p>
                     </div>
                   </div>
                   <div className="preview-section">
                     <span>02</span>
                     <div>
                       <h3>关键知识与跟做步骤</h3>
-                      <p>有原文支持，才能放心回看。</p>
+                      <p>每条要点都能回到原文核对。</p>
                     </div>
                   </div>
                   <div className="preview-memo">
@@ -968,19 +1579,60 @@ export default function Home() {
                               : "可尝试自动提取内容")}
                       <small>
                         {shownNote
-                          ? coverage(shownNote.evidence)
-                          : needsSource
-                            ? "取得实际内容后再整理"
-                            : "只根据读取到的内容生成"}
+                          ? `${active.fullJob ? "已读取原文，正文尚未全部完成" : coverage(shownNote.evidence)}${
+                              shownNote.mode === "full"
+                                ? active.fullJob
+                                  ? ` · 已完成 ${fullSections.length}/${active.fullJob.totalSections} 段`
+                                  : ` · ${shownNote.sectionCount || 0} 段`
+                                : ""
+                            }`
+                          : active.fullJob
+                            ? `完整整理中 · 已完成 ${fullSections.length}/${active.fullJob.totalSections} 段`
+                            : needsSource
+                              ? "取得实际内容后再整理"
+                              : "只根据读取到的内容生成"}
                       </small>
                     </span>
                     <ChevronDown size={16} />
                   </button>
-                  {shownNote?.evidence?.limitation && (
+                  {(shownNote?.evidence || active.fullJob?.source)?.limitation && (
                     <p className="coverage-notice">
-                      {shownNote.evidence.limitation}
+                      {
+                        (shownNote?.evidence || active.fullJob?.source)!
+                          .limitation
+                      }
                     </p>
                   )}
+                  <div className="note-mode-switch" role="group" aria-label="整理方式">
+                    <button
+                      className={noteMode === "full" ? "active" : ""}
+                      disabled={active.generationState === "running"}
+                      aria-pressed={noteMode === "full"}
+                      onClick={() =>
+                        updateDocument(active.id, (value) => ({
+                          ...value,
+                          noteMode: "full",
+                        }))
+                      }
+                    >
+                      全文整理
+                      <small>保留内容细节，去掉寒暄和重复</small>
+                    </button>
+                    <button
+                      className={noteMode === "study" ? "active" : ""}
+                      disabled={active.generationState === "running"}
+                      aria-pressed={noteMode === "study"}
+                      onClick={() =>
+                        updateDocument(active.id, (value) => ({
+                          ...value,
+                          noteMode: "study",
+                        }))
+                      }
+                    >
+                      简短摘要
+                      <small>只看要点，每次一个片段</small>
+                    </button>
+                  </div>
                   <div className="document-actions">
                     <div>
                       {active.generationState === "running" ? (
@@ -989,21 +1641,39 @@ export default function Home() {
                           <span>
                             {job?.id === active.id ? job.status : "正在整理…"}
                           </span>
+                          {!!job?.total && (
+                            <span className="job-count">
+                              {job.done || 0}/{job.total}
+                            </span>
+                          )}
                           <button
                             className="secondary"
                             onClick={() => jobRef.current?.controller.abort()}
                           >
                             <Square size={13} />
-                            停止生成
+                            停止整理
                           </button>
+                          {!!job?.total && (
+                            <progress
+                              className="job-progress"
+                              value={job.done || 0}
+                              max={job.total}
+                            />
+                          )}
                         </div>
                       ) : (
                         <button
                           className={shownNote?.text ? "secondary" : "primary"}
                           disabled={!!job || opening}
-                          onClick={() =>
-                            needsSource ? setSourceOpen(true) : generate()
-                          }
+                          onClick={() => {
+                            if (needsSource && !canResumeFull) {
+                              setSourceOpen(true);
+                            } else if (noteMode === "full") {
+                              generateFull(canResumeFull);
+                            } else {
+                              generate();
+                            }
+                          }}
                         >
                           {needsSource ? (
                             <Plus size={16} />
@@ -1012,12 +1682,18 @@ export default function Home() {
                           )}
                           {needsSource
                             ? "补充字幕"
-                            : shownNote?.text
-                              ? "重新生成"
-                              : active.transcriptOffset > 0 ||
-                                  totalCharacters > 20000
-                                ? "整理所选片段"
-                                : "生成学习笔记"}
+                            : noteMode === "full"
+                              ? canResumeFull
+                                ? `继续整理 · ${fullSections.length}/${active.fullJob?.totalSections || "?"} 段`
+                                : shownNote?.text
+                                  ? "重新生成完整文档"
+                                  : "生成完整文档"
+                              : shownNote?.text
+                                ? "重新生成学习笔记"
+                                : active.transcriptOffset > 0 ||
+                                    totalCharacters > 20000
+                                  ? "整理所选片段"
+                                  : "生成学习笔记"}
                         </button>
                       )}
                     </div>
@@ -1034,6 +1710,34 @@ export default function Home() {
                       另一节正在生成，完成或停止后可整理这一节。
                     </p>
                   )}
+                  {active.fullJob &&
+                    active.generationState !== "running" &&
+                    fullSections.length > 0 && (
+                      <div className="notice full-job-notice" role="status">
+                        <strong>
+                          完整文档已完成 {fullSections.length}/
+                          {active.fullJob.totalSections} 段
+                        </strong>
+                        <p>
+                          {active.fullJob.error ||
+                            "继续整理只会处理尚未完成的段落，不会重复调用已完成内容。"}
+                          继续整理会沿用上次来源；修改材料后会开始新的整理。
+                        </p>
+                        <button
+                          className="text-button"
+                          disabled={!!job}
+                          onClick={() => generateFull(false)}
+                        >
+                          重新开始
+                        </button>
+                        <button
+                          className="text-button"
+                          onClick={() => setSourceOpen(true)}
+                        >
+                          检查内容来源
+                        </button>
+                      </div>
+                    )}
                   {shownNote?.error && !generationError && (
                     <div className="notice" role="alert">
                       <strong>这份内容未完成</strong>
@@ -1041,7 +1745,8 @@ export default function Home() {
                     </div>
                   )}
                   {(generationError ||
-                    active.generationState === "interrupted") && (
+                    active.generationState === "interrupted") &&
+                    !(active.fullJob && fullSections.length > 0) && (
                     <div className="notice" role="alert">
                       <strong>这次生成未完成</strong>
                       <p>
@@ -1051,11 +1756,18 @@ export default function Home() {
                       <button
                         className="text-button"
                         disabled={!!job}
-                        onClick={() =>
-                          needsSource ? setSourceOpen(true) : generate()
-                        }
+                        onClick={() => {
+                          if (needsSource) setSourceOpen(true);
+                          else if (noteMode === "full")
+                            generateFull(canResumeFull);
+                          else generate();
+                        }}
                       >
-                        {needsSource ? "补充字幕" : "重试"}
+                        {needsSource
+                          ? "补充字幕"
+                          : noteMode === "full"
+                            ? "重试完整整理"
+                            : "重试"}
                       </button>
                       <button
                         className="text-button"
@@ -1135,15 +1847,21 @@ export default function Home() {
                       <h2>
                         {needsSource
                           ? "先把这一节的内容补上"
-                          : "把这一节留下来"}
+                          : noteMode === "full"
+                            ? "把这一节完整整理下来"
+                            : "把这一节留下来"}
                       </h2>
                       <p>
                         {needsSource
                           ? "目前无法读取这一节的字幕。粘贴实际字幕或转录文本，就能继续整理。"
-                          : "整理本节目的、关键知识和原文中的步骤。你的笔记与备注会自动保存在这台设备。"}
+                          : noteMode === "full"
+                            ? "逐段整理全部字幕，生成一份完整、可核对、可导出的 Markdown 文档。你的备注会自动保存在这台设备。"
+                            : "整理本节目的、关键知识和原文中的步骤。你的笔记与备注会自动保存在这台设备。"}
                       </p>
                       <div>
-                        <span>有依据的要点</span>
+                        <span>
+                          {noteMode === "full" ? "覆盖全部字幕" : "有依据的要点"}
+                        </span>
                         <span>可恢复的笔记</span>
                         <span>自己的理解</span>
                       </div>
@@ -1152,9 +1870,11 @@ export default function Home() {
                   {shownNote?.text && (
                     <div className="note-tools">
                       <span className="small muted">
-                        {shownNote.status === "partial"
-                          ? "未完成内容"
-                          : "生成完成"}{" "}
+                        {shownNote.mode === "full"
+                          ? `完整文档 · ${shownNote.sectionCount || 0} 段`
+                          : shownNote.status === "partial"
+                            ? "未完成内容"
+                            : "生成完成"}{" "}
                         ·{" "}
                         {new Date(shownNote.generatedAt).toLocaleDateString(
                           "zh-CN",
@@ -1169,7 +1889,9 @@ export default function Home() {
                         onClick={() => exportNote()}
                       >
                         <ArrowDownToLine size={15} />
-                        导出 Markdown
+                        {shownNote.mode === "full"
+                          ? "导出文档（附原文）"
+                          : "导出 Markdown"}
                       </button>
                     </div>
                   )}
@@ -1229,7 +1951,15 @@ export default function Home() {
           <span>
             P{workspace.documents[job.id]?.video.selectedPage || 1} ·{" "}
             {job.status}
+            {job.total ? ` · ${job.done || 0}/${job.total} 段` : ""}
           </span>
+          {!!job.total && (
+            <progress
+              className="job-progress"
+              value={job.done || 0}
+              max={job.total}
+            />
+          )}
           {job.id !== active?.id && (
             <button className="text-button" onClick={() => openSaved(job.id)}>
               查看笔记
@@ -1338,12 +2068,24 @@ export default function Home() {
           )}
         </div>
         {allDocuments.length > 0 && (
-          <button
-            className="text-button danger"
-            onClick={() => setClearOpen(true)}
-          >
-            清除全部本机数据
-          </button>
+          <div className="library-footer">
+            {(active || document)?.video.pages &&
+              ((active || document)!.video.pages?.length || 0) > 1 && (
+                <button
+                  className="text-button"
+                  onClick={() => exportCourse(active || document)}
+                >
+                  <ArrowDownToLine size={15} />
+                  导出这门课程已整理的章节
+                </button>
+              )}
+            <button
+              className="text-button danger"
+              onClick={() => setClearOpen(true)}
+            >
+              清除全部本机数据
+            </button>
+          </div>
         )}
       </Modal>
       <Modal
@@ -1420,6 +2162,13 @@ export default function Home() {
                     ...value,
                     subtitleIndex: event.target.value,
                     transcriptOffset: 0,
+                    draft: value.draft
+                      ? {
+                          ...value.draft,
+                          evidence: value.draft.evidence || value.fullJob?.source,
+                        }
+                      : undefined,
+                    fullJob: undefined,
                   }))
                 }
               >
@@ -1435,8 +2184,7 @@ export default function Home() {
               )}
               {needsSource && (
                 <p className="notice">
-                  当前分 P
-                  无可读取字幕，自动提取暂不支持这一节。请粘贴这一节的实际内容。
+                  当前视频没有可读取的平台字幕。请粘贴这一节的实际内容，再开始整理。
                 </p>
               )}
               <label htmlFor="source-transcript">
@@ -1444,7 +2192,7 @@ export default function Home() {
               </label>
               <textarea
                 id="source-transcript"
-                maxLength={60000}
+                maxLength={240000}
                 rows={7}
                 disabled={active.generationState === "running"}
                 placeholder="粘贴实际内容。带时间码的字幕可用于片段回看；普通文本用于核对原文。"
@@ -1454,14 +2202,21 @@ export default function Home() {
                     ...value,
                     transcript: event.target.value,
                     transcriptOffset: 0,
+                    draft: value.draft
+                      ? {
+                          ...value.draft,
+                          evidence: value.draft.evidence || value.fullJob?.source,
+                        }
+                      : undefined,
+                    fullJob: undefined,
                     updatedAt: Date.now(),
                   }))
                 }
               />
               <p className="small muted">
-                {active.transcript.length}/60000 字符。填写后优先使用这份文本。
+                {active.transcript.length}/240000 字符。填写后优先使用这份文本。
               </p>
-              {totalCharacters > 20000 && (
+              {noteMode === "study" && totalCharacters > 20000 && (
                 <div className="range-picker">
                   <label htmlFor="source-range">本次整理范围</label>
                   <select
@@ -1493,18 +2248,25 @@ export default function Home() {
               <div className="inline-actions">
                 <button
                   className="primary"
-                  disabled={!!job || needsSource}
+                  disabled={!!job || (needsSource && !canResumeFull)}
                   onClick={() => {
                     if (active.transcript.trim() && manualCharacters < 30) {
                       setNotice("请粘贴至少 30 个字符的实际视频内容。");
                       return;
                     }
                     setSourceOpen(false);
-                    generate();
+                    if (noteMode === "full") generateFull(canResumeFull);
+                    else generate();
                   }}
                 >
                   <Sparkles size={16} />
-                  {totalCharacters > 20000 ? "整理所选片段" : "生成学习笔记"}
+                  {noteMode === "full"
+                    ? canResumeFull
+                      ? "继续整理完整文档"
+                      : "生成完整文档"
+                    : totalCharacters > 20000
+                      ? "整理所选片段"
+                      : "生成学习笔记"}
                 </button>
                 <button
                   className="text-button"
@@ -1526,19 +2288,68 @@ export default function Home() {
             </section>
             {shownNote && (
               <section className="tool-section">
-                <h3>当前笔记的依据</h3>
+                <h3>当前内容的依据</h3>
                 <p>
-                  {shownNote.source || "未取得来源"} ·{" "}
-                  {coverage(shownNote.evidence)}
+                  {shownNote.source ||
+                    active.fullJob?.source.label ||
+                    "未取得来源"}{" "}
+                  · {active.fullJob ? `原文已读取，正文完成 ${fullSections.length}/${active.fullJob.totalSections} 段` : coverage(shownNote.evidence)}
                 </p>
-                {shownNote.evidence?.limitation && (
-                  <p className="notice">{shownNote.evidence.limitation}</p>
+                {(shownNote.evidence || active.fullJob?.source)?.limitation && (
+                  <p className="notice">
+                    {(shownNote.evidence || active.fullJob?.source)?.limitation}
+                  </p>
                 )}
                 <p className="small muted">
                   文本依据不包含对全部视频画面的核验。
                 </p>
                 {sourceCues.length ? (
                   <>
+                    <div className="source-summary">
+                      <span>
+                        {noteMode === "full" || shownNote.mode === "full"
+                          ? "完整字幕原文"
+                          : "本次整理的原文"}
+                      </span>
+                      <strong>{sourceCues.length} 条</strong>
+                      <span>
+                        {sourceCues
+                          .reduce((sum, cue) => sum + cue.text.length, 0)
+                          .toLocaleString("zh-CN")}{" "}
+                        字
+                      </span>
+                    </div>
+                    <div className="inline-actions source-actions">
+                      <button
+                        className="text-button"
+                        onClick={async () => {
+                          try {
+                            await navigator.clipboard.writeText(
+                              cuesToPlainText(sourceCues),
+                            );
+                            setNotice("原文已复制到剪贴板。");
+                          } catch {
+                            setNotice("复制失败，请展开原文手动选择。");
+                          }
+                        }}
+                      >
+                        <Copy size={14} />
+                        复制完整原文
+                      </button>
+                      <button
+                        className="text-button"
+                        onClick={() => {
+                          saveTextFile(
+                            sourceSrt || cuesToPlainText(sourceCues),
+                            `${fileBaseName(partName(active.video))}.${sourceSrt ? "srt" : "txt"}`,
+                            "text/plain;charset=utf-8",
+                          );
+                        }}
+                      >
+                        <ArrowDownToLine size={14} />
+                        {sourceSrt ? "下载 SRT 字幕" : "下载原文"}
+                      </button>
+                    </div>
                     <label className="search-field">
                       <Search size={15} />
                       <input
@@ -1551,7 +2362,7 @@ export default function Home() {
                       />
                     </label>
                     <div className="source-cues">
-                      {matchingCues.map((cue) => (
+                      {visibleCues.map((cue) => (
                         <div
                           key={cue.id}
                           className={
@@ -1577,6 +2388,12 @@ export default function Home() {
                         </div>
                       ))}
                     </div>
+                    {visibleCues.length < matchingCues.length && (
+                      <p className="small muted">
+                        共匹配 {matchingCues.length} 条，界面只显示前{" "}
+                        {visibleCues.length} 条；可搜索、复制或下载完整原文。
+                      </p>
+                    )}
                   </>
                 ) : (
                   <p className="muted">
