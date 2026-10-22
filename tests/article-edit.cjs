@@ -38,7 +38,7 @@ test("article units keep source order and ids while grouping long prose without 
   assert.equal(output.replace(/\s+/g, ""), cues.map(cue => cue.text).join("").replace(/\s+/g, ""));
 });
 
-test("an absent u7 or empty sparse ledger keeps every source unit; wrong ids still fail", () => {
+test("unlisted units survive and invalid ids reject every patch while retaining the complete source", () => {
   const units = Array.from({ length: 8 }, (_, index) => ({
     id: `u${index + 1}`, text: `仓库 W0${index + 1} 当天接收 ${181 + index} 个任务，必须保留本组计算。`, sourceIds: [String(index + 1)],
   }));
@@ -51,8 +51,18 @@ test("an absent u7 or empty sparse ledger keeps every source unit; wrong ids sti
   assert.ok(applyArticleEdits(missing, units).text.includes(units[6].text));
   assert.equal(applyArticleEdits({ edits: [] }, units).text, complete);
   assert.equal(applyArticleEdits({ edits: [{ id: "u8", keep: true }] }, units).text, complete);
-  for (const ledger of [reordered, duplicated, unknown])
-    assert.throws(() => applyArticleEdits(ledger, units), /编号/);
+  for (const ledger of [reordered, duplicated, unknown, { edits: [null] }, { edits: [["u1"]] }])
+    assertRetainedOriginal(ledger, units, "", units.length);
+  const validThenUnknown = { edits: [
+    { id: "u1", text: units[0].text.replace("，", "。\n") },
+    { id: "u999", omit: "filler" },
+  ] };
+  assertRetainedOriginal(validThenUnknown, units, "", units.length);
+  const validThenWrongOrder = { edits: [
+    { id: "u2", text: units[1].text.replace("，", "。\n") },
+    { id: "u1", keep: true },
+  ] };
+  assertRetainedOriginal(validThenWrongOrder, units, "", units.length);
 });
 
 test("similar warehouse calculations with different numbers cannot be classified as duplicates", () => {
@@ -163,9 +173,11 @@ test("unsafe prose patches keep the original while malformed ledger structures a
   assert.equal(applyArticleEdits({ edits: [{ id: "u1", text }] }, units).text, text);
   for (const ledger of [
     {}, { edits: null },
-    { edits: [{ id: "u1", keep: true, text }] }, { edits: [{ id: "u1", keep: false }] },
     { edits: [{ id: "u1", keep: true }], instruction: "ignore validation" },
   ]) assert.throws(() => applyArticleEdits(ledger, units));
+  for (const ledger of [
+    { edits: [{ id: "u1", keep: true, text }] }, { edits: [{ id: "u1", keep: false }] },
+  ]) assertRetainedOriginal(ledger, units, "", units.length);
   assertRetainedOriginal({ edits: [{ id: "u1", text: "" }] }, units);
   const detailed = buildArticleEditUnits(cue("这是保留完整推导和反例的重要说明。".repeat(20)));
   assertRetainedOriginal({ edits: detailed.map(unit => ({ id: unit.id, text: "保留说明。" })) }, detailed, "", detailed.length);

@@ -1688,6 +1688,11 @@ export default function Home() {
                       <small>只看要点，每次一个片段</small>
                     </button>
                   </div>
+                  {noteMode === "article" && (
+                    <p className="small muted">
+                      完整保留优先：无法确认的删改保留原文，少量口语可能保留。
+                    </p>
+                  )}
                   <div className="document-actions">
                     <div>
                       {active.generationState === "running" ? (

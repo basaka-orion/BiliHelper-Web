@@ -243,19 +243,29 @@ export function applyArticleEdits(
   const positions = new Map<string, number>(units.map((unit, index) => [unit.id, index] as [string, number]));
   const explicit = new Map<string, Record<string, unknown>>();
   let previousPosition = -1;
+  let rejectedLedger = false;
   for (const edit of edits) {
-    if (!edit || typeof edit !== "object" || Array.isArray(edit))
-      throw new Error("文稿编辑账本包含无效单元，请重试当前段。");
+    if (!edit || typeof edit !== "object" || Array.isArray(edit)) {
+      rejectedLedger = true;
+      break;
+    }
     const row = edit as Record<string, unknown>;
     const position = typeof row.id === "string" ? positions.get(row.id) : undefined;
-    if (position === undefined || position <= previousPosition)
-      throw new Error("文稿编辑账本的原文编号未知、重复或顺序错误，请重试当前段。");
+    const keys = Object.keys(row).filter((key) => key !== "id");
+    const operation = (keys.length === 1 && (row.keep === true || typeof row.text === "string" || row.omit === "filler")) ||
+      (keys.length === 2 && row.omit === "duplicate" && typeof row.duplicateOf === "string");
+    if (position === undefined || position <= previousPosition || !operation) {
+      rejectedLedger = true;
+      break;
+    }
     explicit.set(row.id as string, row);
     previousPosition = position;
   }
+  // A bad id must never attach an edit to the wrong source. Reject every patch together.
+  if (rejectedLedger) explicit.clear();
   const rendered: string[] = [];
   const kept = new Map<string, string>();
-  let retainedOriginalCount = 0;
+  let retainedOriginalCount = rejectedLedger ? units.length : 0;
   for (const unit of units) {
     const row = explicit.get(unit.id) || { id: unit.id, keep: true };
     const keys = Object.keys(row).filter((key) => key !== "id");

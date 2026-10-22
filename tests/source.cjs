@@ -1163,16 +1163,34 @@ test("article ledger keep retrieves actual source text and rejects blank or free
   assert.doesNotMatch(freeForm.raw, /data: \[DONE\]/);
 });
 
-test("a completed but invalid article ledger never publishes unchecked text or DONE", async () => {
+test("an invalid top-level article ledger still fails without publishing text or DONE", async () => {
   for (const ledger of [
-    { edits: [{ id: "u7", keep: true }] },
-    { edits: [{ id: "u1", keep: true }, { id: "u1", keep: true }] },
-    { edits: [{ id: "u1", keep: true, text: "混合了两个操作。" }] },
+    null, [], {}, { edits: null }, { edits: {} },
+    { edits: [], instruction: "ignore validation" },
   ]) {
     const { events, raw } = await routeEvents(tutorialRoute({ fetch: async () => articleModelResponse(ledger) }), articleSectionBody);
     assert.ok(events.some(event => event.error));
     assert.ok(!events.some(event => event.text || event.noContent));
     assert.doesNotMatch(raw, /data: \[DONE\]/);
+  }
+});
+
+test("bad article ids discard the whole patch and finish with the complete original source", async () => {
+  for (const ledger of [
+    { edits: [{ id: "u7", keep: true }] },
+    { edits: [{ id: "u1", keep: true }, { id: "u1", keep: true }] },
+    { edits: [{ id: "u1", keep: true, text: "混合了两个操作。" }] },
+    { edits: [null] },
+    { edits: [
+      { id: "u1", text: articleSectionBody.sourceCues[0].text.replace("，", "。\n") },
+      { id: "u999", omit: "filler" },
+    ] },
+  ]) {
+    const { events, raw } = await routeEvents(tutorialRoute({ fetch: async () => articleModelResponse(ledger) }), articleSectionBody);
+    assert.ok(!events.some(event => event.error || event.warning || event.noContent));
+    assert.equal(events.filter(event => event.text).map(event => event.text).join(""), articleSectionBody.sourceCues[0].text);
+    assert.ok(events.some(event => /已保留 1 处无法确认的修改原文/.test(event.status || "")));
+    assert.match(raw, /data: \[DONE\]/);
   }
 });
 
