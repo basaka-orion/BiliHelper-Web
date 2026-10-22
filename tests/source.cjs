@@ -1165,7 +1165,6 @@ test("article ledger keep retrieves actual source text and rejects blank or free
 
 test("a completed but invalid article ledger never publishes unchecked text or DONE", async () => {
   for (const ledger of [
-    { edits: [] },
     { edits: [{ id: "u7", keep: true }] },
     { edits: [{ id: "u1", omit: "filler" }] },
     { edits: [{ id: "u1", text: "只需构建。" }] },
@@ -1174,6 +1173,28 @@ test("a completed but invalid article ledger never publishes unchecked text or D
     assert.ok(events.some(event => event.error));
     assert.ok(!events.some(event => event.text || event.noContent));
     assert.doesNotMatch(raw, /data: \[DONE\]/);
+  }
+});
+
+test("a sparse article response preserves every unlisted unit instead of dropping model-omitted ids", async () => {
+  const cues = Array.from({ length: 8 }, (_, index) => ({
+    id: String(index + 1),
+    text: `仓库 W0${index + 1} 接收 ${181 + index} 个任务，必须保留本组计算和反例。`.repeat(15),
+  }));
+  for (const sparse of [false, true]) {
+    const post = tutorialRoute({ fetch: async (_url, options) => {
+      const sent = JSON.parse(options.body);
+      const payload = JSON.parse(sent.messages.at(-1).content.split("以下为 JSON 来源资料：\n")[1]);
+      assert.ok(payload.units.length >= 8);
+      return articleModelResponse({ edits: sparse ? [{ id: payload.units.at(-1).id, keep: true }] : [] });
+    } });
+    const { events, raw } = await routeEvents(post, { ...articleSectionBody, sourceCues: cues });
+    assert.ok(!events.some(event => event.error || event.noContent));
+    const text = events.filter(event => event.text).map(event => event.text).join("");
+    assert.equal(text.replace(/\s+/g, ""), cues.map(cue => cue.text).join("").replace(/\s+/g, ""));
+    assert.match(text, /W07/);
+    assert.doesNotMatch(text, /"edits"/);
+    assert.match(raw, /data: \[DONE\]/);
   }
 });
 

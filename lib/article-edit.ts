@@ -228,7 +228,7 @@ function assertEditedText(source: string, edited: string, id: string): void {
     throw new Error(`文稿单元 ${id} 的实质文字发生删改，只允许修正标点和分段，请保留原文后重试。`);
 }
 
-/** Validate the complete ledger before any model JSON or unchecked prose reaches the UI. */
+/** Apply sparse edits; unlisted source units always survive as keep, never as omission. */
 export function applyArticleEdits(
   value: unknown,
   units: ArticleEditUnit[],
@@ -239,17 +239,23 @@ export function applyArticleEdits(
       !Array.isArray((value as { edits?: unknown }).edits))
     throw new Error("文稿编辑账本格式无效，请重试当前段。");
   const edits = (value as { edits: unknown[] }).edits;
-  if (edits.length !== units.length)
-    throw new Error("文稿编辑账本遗漏了原文单元，尚未整理完整，请重试当前段。");
-  const rendered: string[] = [];
-  const kept = new Map<string, string>();
-  for (let index = 0; index < units.length; index++) {
-    const unit = units[index], edit = edits[index];
+  const positions = new Map<string, number>(units.map((unit, index) => [unit.id, index] as [string, number]));
+  const explicit = new Map<string, Record<string, unknown>>();
+  let previousPosition = -1;
+  for (const edit of edits) {
     if (!edit || typeof edit !== "object" || Array.isArray(edit))
       throw new Error("文稿编辑账本包含无效单元，请重试当前段。");
     const row = edit as Record<string, unknown>;
-    if (row.id !== unit.id)
-      throw new Error("文稿编辑账本的原文编号缺失、重复或顺序错误，请重试当前段。");
+    const position = typeof row.id === "string" ? positions.get(row.id) : undefined;
+    if (position === undefined || position <= previousPosition)
+      throw new Error("文稿编辑账本的原文编号未知、重复或顺序错误，请重试当前段。");
+    explicit.set(row.id as string, row);
+    previousPosition = position;
+  }
+  const rendered: string[] = [];
+  const kept = new Map<string, string>();
+  for (const unit of units) {
+    const row = explicit.get(unit.id) || { id: unit.id, keep: true };
     const keys = Object.keys(row).filter((key) => key !== "id");
     let text = "";
     if (row.keep === true && keys.length === 1) {

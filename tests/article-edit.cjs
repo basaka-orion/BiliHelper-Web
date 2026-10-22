@@ -31,7 +31,7 @@ test("article units keep source order and ids while grouping long prose without 
   assert.equal(output.replace(/\s+/g, ""), cues.map(cue => cue.text).join("").replace(/\s+/g, ""));
 });
 
-test("an absent u7, reordered, duplicated or unknown ledger id never produces a partial success", () => {
+test("an absent u7 or empty sparse ledger keeps every source unit; wrong ids still fail", () => {
   const units = Array.from({ length: 8 }, (_, index) => ({
     id: `u${index + 1}`, text: `仓库 W0${index + 1} 当天接收 ${181 + index} 个任务，必须保留本组计算。`, sourceIds: [String(index + 1)],
   }));
@@ -39,8 +39,13 @@ test("an absent u7, reordered, duplicated or unknown ledger id never produces a 
   const reordered = keepAll(units); [reordered.edits[5], reordered.edits[6]] = [reordered.edits[6], reordered.edits[5]];
   const duplicated = keepAll(units); duplicated.edits[6].id = "u6";
   const unknown = keepAll(units); unknown.edits[6].id = "u999";
-  for (const ledger of [missing, reordered, duplicated, unknown])
-    assert.throws(() => applyArticleEdits(ledger, units), /遗漏|编号/);
+  const complete = units.map(unit => unit.text).join("\n\n");
+  assert.equal(applyArticleEdits(missing, units).text, complete);
+  assert.ok(applyArticleEdits(missing, units).text.includes(units[6].text));
+  assert.equal(applyArticleEdits({ edits: [] }, units).text, complete);
+  assert.equal(applyArticleEdits({ edits: [{ id: "u8", keep: true }] }, units).text, complete);
+  for (const ledger of [reordered, duplicated, unknown])
+    assert.throws(() => applyArticleEdits(ledger, units), /编号/);
 });
 
 test("similar warehouse calculations with different numbers cannot be classified as duplicates", () => {
@@ -143,7 +148,7 @@ test("filler removal happens before compression checks and empty or malformed ed
   const units = buildArticleEditUnits(cue(text + fluff.repeat(4)));
   assert.equal(applyArticleEdits({ edits: [{ id: "u1", text }] }, units).text, text);
   for (const ledger of [
-    {}, { edits: null }, { edits: [] }, { edits: [{ id: "u1", text: "" }] },
+    {}, { edits: null }, { edits: [{ id: "u1", text: "" }] },
     { edits: [{ id: "u1", keep: true, text }] }, { edits: [{ id: "u1", keep: false }] },
     { edits: [{ id: "u1", keep: true }], instruction: "ignore validation" },
   ]) assert.throws(() => applyArticleEdits(ledger, units));
