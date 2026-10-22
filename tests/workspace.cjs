@@ -10,6 +10,7 @@ const {
   migrateHistory,
   serializeWorkspace,
   upsertDocument,
+  readMindMapSection,
 } = require(path.join(process.env.BILI_TEST_BUILD, "workspace.js"));
 
 const url = "https://www.bilibili.com/video/BV1wD4y1o7AS";
@@ -537,4 +538,185 @@ test("only article jobs can persist empty advertising ranges; unmarked empty con
   const restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
   assert.equal(restored.fullJob.sections.length, 0);
   assert.equal(restored.fullJob.mode, "article");
+});
+
+function mapSection(index, cueIds, sourceIds = cueIds) {
+  return {
+    version: 1, index, cueIds, sourceIds, fallback: false,
+    nodes: sourceIds.length ? [{ id: `s${index + 1}-n1`, text: `第${index + 1}段原文细节`, sourceIds, children: [] }] : [],
+  };
+}
+
+function mindmap(cues, sections, totalSections, status = "paused") {
+  return {
+    version: 1, title: "完整课程导图", status, sections, totalSections,
+    source: { kind: "subtitle", label: "完整字幕", coverage: "full", cues,
+      totalCharacters: cues.map(cue => cue.text).join("\n").length,
+      analyzedCharacters: cues.map(cue => cue.text).join("\n").length },
+    generatedAt: 100, updatedAt: 200,
+  };
+}
+
+test("mindmap progress and source survive reload while an interrupted request becomes paused", () => {
+  const document = createDocument(video());
+  document.note = note("已有文章与导图分别保存");
+  const cues = [
+    { id: "1", text: "甲".repeat(3500), start: 0, end: 5 },
+    { id: "2", text: "嗯，好，继续。", start: 5, end: 6 },
+    { id: "3", text: "乙".repeat(3500), start: 6, end: 10 },
+  ];
+  document.mindmap = mindmap(cues, [mapSection(0, ["1"])], 2, "running");
+  document.mindmap.sections[0].nodes[0].text = "原文代码 <script>alert(1)</script> 保持纯文本";
+  const raw = serializeWorkspace(workspaceWith(document));
+  assert.equal(JSON.parse(raw).documents[document.id].mindmap.status, "running");
+  const restored = readWorkspace(raw).documents[document.id];
+  assert.deepEqual(restored.mindmap, { ...document.mindmap, status: "paused" });
+  assert.deepEqual(restored.note, document.note);
+  assert.equal(document.mindmap.status, "running", "saving must not mutate the active map request");
+  delete document.mindmap;
+  assert.equal(readWorkspace(serializeWorkspace(workspaceWith(document))).documents[document.id].mindmap, undefined);
+});
+
+test("completed mindmaps retain every chunk cue id including omitted filler and empty filler-only sections", () => {
+  const document = createDocument(video());
+  const cues = [
+    { id: "1", text: "甲".repeat(3500) },
+    { id: "2", text: "大家好，喜欢的话记得点赞关注。谢谢大家观看，下次见。" },
+    { id: "3", text: "乙".repeat(3500) },
+  ];
+  document.mindmap = mindmap(cues, [mapSection(0, ["1"]), mapSection(1, ["2", "3"], ["3"])], 2, "complete");
+  let restored = readWorkspace(serializeWorkspace(workspaceWith(document))).documents[document.id];
+  assert.deepEqual(restored.mindmap, document.mindmap);
+  document.mindmap = mindmap([{ id: "1", text: "大家好，喜欢的话记得点赞关注。谢谢大家观看，下次见。" }], [mapSection(0, ["1"], [])], 1, "complete");
+  restored = readWorkspace(serializeWorkspace(workspaceWith(document))).documents[document.id];
+  assert.deepEqual(restored.mindmap.sections[0].cueIds, ["1"]);
+  assert.deepEqual(restored.mindmap.sections[0].nodes, []);
+  assert.equal(restored.mindmap.status, "complete");
+  document.mindmap.sections[0].cueIds = [];
+  assert.throws(() => serializeWorkspace(workspaceWith(document)), /思维导图.*尚未保存.*导出/);
+});
+
+test("an empty map section counts as complete only when its actual source contains no substantive units", () => {
+  const document = createDocument(video());
+  const cues = [{ id: "1", text: "甲".repeat(3500) }, { id: "2", text: "安装命令为 npm install，必须先安装依赖。" }];
+  document.mindmap = mindmap(cues, [mapSection(0, ["1"]), mapSection(1, ["2"], [])], 2, "complete");
+  assert.throws(() => serializeWorkspace(workspaceWith(document)), /思维导图.*尚未保存/);
+  const restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.mindmap.status, "error");
+  assert.equal(restored.mindmap.sections.length, 1);
+  assert.deepEqual(restored.mindmap.sections[0], document.mindmap.sections[0]);
+  assert.match(restored.mindmap.error, /第 2 段重试/);
+});
+
+test("map recovery updates chunk boundaries, preserves only a matching prefix and cannot label partial work complete", () => {
+  const document = createDocument(video());
+  const cues = [1, 2, 3].map(id => ({ id: String(id), text: "字".repeat(3500) }));
+  document.mindmap = mindmap(cues, [mapSection(0, ["1"])], 2, "complete");
+  assert.throws(() => serializeWorkspace(workspaceWith(document)), /思维导图.*尚未保存/);
+  let restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.mindmap.status, "error");
+  assert.equal(restored.mindmap.totalSections, 3);
+  assert.equal(restored.mindmap.sections.length, 1);
+  assert.match(restored.mindmap.error, /已保留 1 段.*第 2 段重试/);
+  assert.doesNotThrow(() => serializeWorkspace(workspaceWith(restored)));
+  document.mindmap.totalSections = 3;
+  restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+  assert.equal(restored.mindmap.status, "error");
+  assert.match(restored.mindmap.error, /尚未完成.*第 2 段/);
+});
+
+test("map recovery rejects wrong source ids, reordered ranges and bad nodes without skipping an invalid middle section", () => {
+  const document = createDocument(video());
+  const cues = [
+    { id: "1", text: "甲".repeat(3500) },
+    { id: "2", text: "乙".repeat(1000) },
+    { id: "3", text: "丙".repeat(1000) },
+    { id: "4", text: "丁".repeat(1000) },
+    { id: "5", text: "戊".repeat(3500) },
+  ];
+  const good = mindmap(cues, [mapSection(0, ["1"]), mapSection(1, ["2", "3", "4"]), mapSection(2, ["5"])], 3, "complete");
+  const corruptions = [
+    map => { map.sections[1].cueIds = ["3", "2", "4"]; },
+    map => { map.sections[1].index = 2; },
+    map => { map.sections[1].nodes[0].sourceIds = ["1"]; },
+    map => { map.sections[1].sourceIds = ["99"]; },
+    map => { map.sections[1].nodes[0].text = " "; },
+    map => { map.sections[1].nodes[0].children = {}; },
+    map => { map.sections[1].nodes[0].id = "s1-n1"; },
+    map => { map.sections[1].nodes.push({ ...map.sections[1].nodes[0] }); },
+    map => { map.sections[1].nodes[0].children = [{ id: "s2-n2", text: "子节点", sourceIds: ["2"], children: [] }]; },
+  ];
+  for (const corrupt of corruptions) {
+    document.mindmap = structuredClone(good);
+    corrupt(document.mindmap);
+    assert.throws(() => serializeWorkspace(workspaceWith(document)), /思维导图.*尚未保存/);
+    const restored = readWorkspace(JSON.stringify(workspaceWith(document))).documents[document.id];
+    assert.equal(restored.mindmap.sections.length, 1);
+    assert.equal(restored.mindmap.status, "error");
+    assert.deepEqual(restored.mindmap.sections[0], good.sections[0]);
+    assert.match(restored.mindmap.error, /第 2 段重试/);
+    assert.deepEqual(restored.mindmap.source.cues, cues);
+  }
+});
+
+test("API map validation bounds trees, permits long verbatim leaves and validates source unions", () => {
+  const good = mapSection(0, ["1"]);
+  good.nodes[0].text = "代码".repeat(3500);
+  assert.ok(readMindMapSection(good, ["1"]), "cross-cue verbatim code can be longer than one cue");
+  const deep = structuredClone(good);
+  let node = deep.nodes[0];
+  for (let depth = 2; depth <= 5; depth++) {
+    node.children = [{ id: `depth-${depth}`, text: "细节", sourceIds: ["1"], children: [] }];
+    node = node.children[0];
+  }
+  assert.equal(readMindMapSection(deep, ["1"]), undefined);
+  const long = structuredClone(good);
+  long.nodes[0].text = "字".repeat(9001);
+  assert.equal(readMindMapSection(long, ["1"]), undefined);
+  const wide = structuredClone(good);
+  wide.nodes = Array.from({ length: 18001 }, (_, index) => ({ id: `n-${index}`, text: "字", sourceIds: ["1"], children: [] }));
+  assert.equal(readMindMapSection(wide, ["1"]), undefined);
+  const verbose = structuredClone(good);
+  verbose.nodes = Array.from({ length: 81 }, (_, index) => ({ id: `n-${index}`, text: "字".repeat(9000), sourceIds: ["1"], children: [] }));
+  assert.equal(readMindMapSection(verbose, ["1"]), undefined);
+  assert.equal(readMindMapSection({ ...good, sourceIds: [] }, ["1"]), undefined);
+  assert.equal(readMindMapSection(good, ["2"]), undefined);
+});
+
+test("invalid map metadata or source cannot silently disappear during serialization", () => {
+  const document = createDocument(video());
+  const good = mindmap([{ id: "1", text: "真实内容" }], [mapSection(0, ["1"])], 1, "complete");
+  for (const corrupt of [
+    map => { map.version = 2; },
+    map => { map.title = "字".repeat(1001); },
+    map => { map.generatedAt = -1; },
+    map => { map.error = "字".repeat(10001); },
+    map => { map.source.coverage = "partial"; },
+    map => { map.source.cues[0].start = -1; },
+    map => { map.source.cues[0].text = "字".repeat(240001); },
+    map => { map.source.totalCharacters = -1; },
+    map => { map.source.limitation = {}; },
+  ]) {
+    document.mindmap = structuredClone(good);
+    corrupt(document.mindmap);
+    assert.throws(() => serializeWorkspace(workspaceWith(document)), /思维导图.*尚未保存.*导出/);
+  }
+  document.mindmap = null;
+  assert.throws(() => serializeWorkspace(workspaceWith(document)), /思维导图.*尚未保存/);
+});
+
+test("a document containing only a mindmap is protected from empty-document pruning", () => {
+  const protectedDocument = createDocument(video());
+  protectedDocument.updatedAt = 0;
+  protectedDocument.mindmap = mindmap([{ id: "1", text: "仅有导图的原文" }], [mapSection(0, ["1"])], 1, "complete");
+  let state = workspaceWith(protectedDocument);
+  for (let part = 2; part <= 40; part++) {
+    const document = createDocument(video(part));
+    document.updatedAt = part;
+    state = upsertDocument(state, document);
+  }
+  state.activeId = documentId(`${url}?p=40`);
+  const restored = readWorkspace(serializeWorkspace(state));
+  assert.deepEqual(restored.documents[protectedDocument.id].mindmap, protectedDocument.mindmap);
+  assert.equal(Object.keys(restored.documents).length, 25);
 });
