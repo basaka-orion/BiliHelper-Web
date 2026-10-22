@@ -11,7 +11,7 @@ async function resolveShort(url: string) {
     const response = await fetch(url, { redirect: 'manual', headers: biliHeaders, signal: AbortSignal.timeout(8000) })
     const location = response.headers.get('location')
     await response.body?.cancel()
-    if (!location) return parseVideoLink(url)
+    if (!location) throw new HttpError('短链接未能展开，请从原视频页复制完整链接后重试', 502)
     let next
     try { next = parseVideoLink(new URL(location, url).href) }
     catch (e) { throw new HttpError((e as Error).message, 400) }
@@ -73,7 +73,7 @@ export async function POST(req: NextRequest) {
     } catch { subtitleNotice = '平台字幕查询暂不可用，可刷新来源重试，或粘贴这一分 P 的实际字幕文本。' }
     return Response.json({ ...info, subtitles, hasSubtitles: subtitles.length > 0, subtitleNotice })
   } catch (e) {
-    if (resolvedLink?.platform === 'bilibili' && (!(e instanceof HttpError) || e.status >= 500)) return Response.json({ error: '云端暂时无法访问 B 站，正在尝试浏览器解析', browserFallback: true, resolvedUrl: resolvedLink.url }, { status: 502 })
+    if (resolvedLink?.platform === 'bilibili' && (!(e instanceof HttpError) || e.status >= 500)) return Response.json({ error: '云端暂时无法读取 B 站视频信息', browserFallback: true, resolvedUrl: resolvedLink.url }, { status: 502 })
     return errorResponse(e)
   }
 }

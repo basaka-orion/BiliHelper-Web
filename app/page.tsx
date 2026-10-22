@@ -26,6 +26,7 @@ import {
   Undo2,
 } from "lucide-react";
 import { browserVideoInfo, browserSubtitles } from "../lib/browser-bili";
+import { loadVideoInfo } from "../lib/video-import";
 import { refreshVideoSource } from "../lib/refresh-video-source";
 import { parseVideoLink } from "../lib/video-url";
 import { readSSE } from "../lib/sse";
@@ -157,6 +158,7 @@ export default function Home() {
   const [home, setHome] = useState(false);
   const [input, setInput] = useState("");
   const [opening, setOpening] = useState(false);
+  const [openingStatus, setOpeningStatus] = useState("");
   const [inputError, setInputError] = useState("");
   const [legacy, setLegacy] = useState<{ url: string; title: string }[]>([]);
   const [filter, setFilter] = useState("");
@@ -320,6 +322,7 @@ export default function Home() {
     const controller = new AbortController();
     analyzeRef.current = controller;
     setOpening(true);
+    setOpeningStatus("正在读取视频信息…");
     setInputError("");
     const timeout = setTimeout(() => controller.abort(), 55000);
     try {
@@ -330,33 +333,18 @@ export default function Home() {
         setInput("");
         return;
       }
-      let video: VideoInfo | undefined;
-      let serverError: unknown;
-      try {
-        const response = await fetch("/api/video-info", {
+      const video = await loadVideoInfo(
+        value,
+        controller.signal,
+        (input, signal) => fetch("/api/video-info", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          signal: controller.signal,
-          body: JSON.stringify({ url: value }),
-        });
-        const data = await response.json().catch(() => {
-          throw new Error("视频服务暂不可用，请重试。");
-        });
-        if (response.ok) video = data;
-        else throw new Error(data.error || "视频无法打开");
-      } catch (error) {
-        if (controller.signal.aborted) return;
-        serverError = error;
-        // Browser JSONP is a fallback for networks where the cloud API is blocked.
-        if (link.platform === "bilibili" && !link.short) {
-          try {
-            video = await browserVideoInfo(link.url, controller.signal);
-          } catch (browserError) {
-            if (controller.signal.aborted) return;
-            throw serverError instanceof Error ? serverError : browserError;
-          }
-        } else throw error;
-      }
+          signal,
+          body: JSON.stringify({ url: input }),
+        }),
+        browserVideoInfo,
+        () => setOpeningStatus("正在通过浏览器读取视频信息…"),
+      );
       if (controller.signal.aborted || !video) return;
       let metadata = video;
       const nextId = documentId(metadata.url);
@@ -1541,6 +1529,7 @@ export default function Home() {
                     打开视频
                   </button>
                 </form>
+                {opening && <p className="small muted" role="status">{openingStatus}</p>}
                 {inputError && (
                   <p className="input-error" role="alert">
                     {inputError}
@@ -1675,6 +1664,7 @@ export default function Home() {
                   来源与视频信息 <ExternalLink size={14} />
                 </button>
               </div>
+              {opening && <p className="small muted workspace-error" role="status">{openingStatus}</p>}
               {inputError && (
                 <p className="input-error workspace-error" role="alert">
                   {inputError}
