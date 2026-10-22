@@ -241,7 +241,7 @@ export default function Home() {
     const nodes = chunkSourceCues(map.source.cues).flatMap((chunk, index) =>
       (map.sections[index] || buildMindMapSection(undefined, buildMindMapUnits(chunk), index + 1)).nodes,
     );
-    return mindMapRoot(map.title, nodes);
+    return mindMapRoot(map.title, nodes, map.source.cues);
   }, [active?.mindmap]);
   const sourceCues = sourceEvidence?.cues || [];
   const matchingCues = sourceCues.filter(

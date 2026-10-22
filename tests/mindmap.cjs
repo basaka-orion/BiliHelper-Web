@@ -6,6 +6,63 @@ const { buildMindMapUnits, buildMindMapSection } = require(path.join(process.env
 const flatten = (nodes) => nodes.flatMap((node) => [node, ...flatten(node.children)]);
 const leaves = (result) => flatten(result.nodes).filter((node) => !node.children.length);
 const compact = (text) => text.replace(/\s+/g, "");
+const maxDepth = (nodes, depth = 1) => Math.max(depth, ...nodes.map((node) => node.children.length ? maxDepth(node.children, depth + 1) : depth));
+const sourceUnits = (count) => Array.from({ length: count }, (_, index) => ({ id: `u${index + 1}`,
+  text: index === 0 ? "hello大家好，跟着老师学习。解释器用于执行代码，不能把它与编辑器混淆。" :
+    `仓库 W${String(index).padStart(2, "0")} 的恢复条件：剩余任务必须严格少于 ${index + 10}，等于时不得恢复；保留本例的计算、命令与反例。`,
+  sourceIds: [String(index + 1)] }));
+
+for (const count of [33, 45]) test(`a model's single flat ${count}-detail bucket becomes source topics, subtopics and complete detail`, () => {
+  const units = sourceUnits(count);
+  const result = buildMindMapSection({ branches: [{ title: "hello大家好", unitIds: units.map((unit) => unit.id), children: [] }] }, units);
+  assert.equal(result.fallback, true);
+  assert.ok(result.nodes.length >= 3 && result.nodes.length <= 6);
+  assert.equal(maxDepth(result.nodes), 3);
+  assert.ok(result.nodes.every((node) => node.children.length >= 2 && node.children.every((child) => child.children.length > 0)));
+  assert.ok(flatten(result.nodes).every((node) => node.children.filter((child) => !child.children.length).length <= 8));
+  assert.deepEqual(leaves(result).map((node) => node.text), units.map((unit) => unit.text));
+  assert.equal(new Set(flatten(result.nodes).map((node) => node.id)).size, flatten(result.nodes).length);
+  assert.ok(!result.nodes.some((node) => /hello|大家好/i.test(node.text)));
+  assert.ok(result.nodes[0].text.includes("解释器用于执行代码"));
+});
+
+test("an already compliant model hierarchy remains unchanged and does not trigger positional fallback", () => {
+  const units = sourceUnits(16);
+  const branches = [0, 8].map((offset) => ({ title: "条件", unitIds: [], children: [
+    { title: "原理", unitIds: units.slice(offset, offset + 4).map((unit) => unit.id), children: [] },
+    { title: "限制", unitIds: units.slice(offset + 4, offset + 8).map((unit) => unit.id), children: [] },
+  ] }));
+  const result = buildMindMapSection({ branches }, units);
+  assert.equal(result.fallback, false);
+  assert.deepEqual(result.nodes.map((node) => ({ text: node.text, children: node.children.map((child) => ({ text: child.text, count: child.children.length })) })), [
+    { text: "条件", children: [{ text: "原理", count: 4 }, { text: "限制", count: 4 }] },
+    { text: "条件", children: [{ text: "原理", count: 4 }, { text: "限制", count: 4 }] },
+  ]);
+  assert.equal(maxDepth(result.nodes), 3);
+  assert.deepEqual(leaves(result).map((node) => node.text), units.map((unit) => unit.text));
+});
+
+test("overloaded deepest branches split as siblings without exceeding four levels or losing details", () => {
+  const units = sourceUnits(21);
+  const result = buildMindMapSection({ branches: [{ title: "条件", unitIds: [], children: [
+    { title: "原理", unitIds: [], children: [{ title: "限制", unitIds: units.map((unit) => unit.id), children: [] }] },
+  ] }] }, units);
+  assert.equal(result.fallback, true);
+  assert.equal(maxDepth(result.nodes), 4);
+  assert.ok(flatten(result.nodes).every((node) => node.children.filter((child) => !child.children.length).length <= 8));
+  assert.deepEqual(leaves(result).map((node) => node.text), units.map((unit) => unit.text));
+});
+
+test("grouping excessive mixed direct details preserves their order around existing child branches", () => {
+  const units = sourceUnits(20);
+  const result = buildMindMapSection({ branches: [{ title: "条件", unitIds: units.filter((_unit, index) => index !== 4).map((unit) => unit.id), children: [
+    { title: "原理", unitIds: [units[4].id], children: [] },
+  ] }] }, units);
+  assert.equal(result.fallback, true);
+  assert.ok(maxDepth(result.nodes) <= 4);
+  assert.ok(flatten(result.nodes).every((node) => node.children.filter((child) => !child.children.length).length <= 8));
+  assert.deepEqual(leaves(result).map((node) => node.text), units.map((unit) => unit.text));
+});
 
 test("fallback topic labels remove navigation stamps before extracting a short readable heading", () => {
   const units = buildMindMapUnits([{ id: "1", text: "[03:12] 恢复条件，只有剩余任务严格小于 11 才能恢复。" }]);

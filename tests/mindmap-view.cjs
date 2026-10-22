@@ -25,3 +25,16 @@ test("map Markdown exports complete nested details without view state or navigat
   assert.ok(text.includes("  - 事实日期2026-10-22，任务数103−28−8=67。"));
   assert.doesNotMatch(text, /03:12|source:|generatedAt/);
 });
+
+test("code time samples survive when the opening fence is in an earlier source section", () => {
+  const { normalizeFullSourceCues, chunkSourceCues } = require(path.join(process.env.BILI_TEST_BUILD, "learning-source.js"));
+  const { buildMindMapUnits, buildMindMapSection } = require(path.join(process.env.BILI_TEST_BUILD, "mindmap.js"));
+  const code = "```txt\n" + "A".repeat(4500 - 7) + "00:01 --> 00:02\n这是程序输出的字幕样例，必须保留。\n```";
+  const cues = normalizeFullSourceCues([{ id: "1", text: code }]);
+  const nodes = chunkSourceCues(cues).flatMap((chunk, index) => buildMindMapSection(undefined, buildMindMapUnits(chunk), index + 1).nodes);
+  const root = mindMapRoot("代码示例", nodes, cues);
+  const leaf = flattenMindMap(root).find((node) => !node.children.length && node.text.includes("00:01 --> 00:02"));
+  assert.ok(leaf);
+  assert.match(mindMapNodeText(leaf), /00:01 --> 00:02/);
+  assert.match(mindMapMarkdown(root), /00:01 --&gt; 00:02/);
+});

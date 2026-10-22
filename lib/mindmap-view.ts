@@ -1,8 +1,18 @@
 import type { MindMapNode } from "./mindmap";
 import { articleMarkdown } from "./article-export";
+import { buildArticleEditUnits } from "./article-edit";
+import type { SourceCue } from "./learning-source";
 
-export function mindMapRoot(title: string, nodes: MindMapNode[]): MindMapNode {
-  return { id: "map-root", text: articleMarkdown(`# ${title}`).replace(/^#\s*/, "").trim(), sourceIds: [], children: nodes };
+type ViewNode = MindMapNode & { verbatim?: true };
+
+export function mindMapRoot(title: string, nodes: MindMapNode[], source: SourceCue[] = []): MindMapNode {
+  // Use the whole source to recognize code split across API sections. A detail
+  // leaf alone may not contain its opening fence, so cannot safely be cleaned.
+  const protectedText = source.some((cue) => cue.text.trim()) ? buildArticleEditUnits(source).filter((unit) => unit.verbatim).map((unit) => unit.text) : [];
+  const protect = (node: MindMapNode): ViewNode => ({ ...node,
+    ...(node.text && protectedText.some((text) => text.includes(node.text)) ? { verbatim: true as const } : {}),
+    children: node.children.map(protect) });
+  return { id: "map-root", text: articleMarkdown(`# ${title}`).replace(/^#\s*/, "").trim(), sourceIds: [], children: nodes.map(protect) };
 }
 
 export function flattenMindMap(root: MindMapNode): MindMapNode[] {
@@ -12,8 +22,8 @@ export function flattenMindMap(root: MindMapNode): MindMapNode[] {
   return result;
 }
 
-export function mindMapNodeText(node: MindMapNode): string {
-  return articleMarkdown(node.text).trim();
+export function mindMapNodeText(node: ViewNode): string {
+  return node.verbatim ? node.text : articleMarkdown(node.text).trim();
 }
 
 export function escapeMapHtml(text: string): string {
@@ -31,13 +41,13 @@ export function mindMapViewData(node: MindMapNode, foldDepth = 1, depth = 0) {
 
 /** A portable outline containing all detail, independent of the current SVG folds. */
 export function mindMapMarkdown(root: MindMapNode): string {
-  const literal = (text: string) => articleMarkdown(text).trim()
+  const literal = (node: MindMapNode) => mindMapNodeText(node)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/([\\`*_\[\]#])/g, "\\$1");
-  const lines = [`# ${literal(root.text).replace(/\n+/g, " ")}`, ""];
+  const lines = [`# ${literal(root).replace(/\n+/g, " ")}`, ""];
   const walk = (node: MindMapNode, depth: number) => {
     const indent = "  ".repeat(depth);
-    const text = literal(node.text).replace(/\n/g, `\n${indent}  `);
+    const text = literal(node).replace(/\n/g, `\n${indent}  `);
     if (text) lines.push(`${indent}- ${text}`);
     node.children.forEach((child) => walk(child, depth + 1));
   };
