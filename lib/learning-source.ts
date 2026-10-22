@@ -16,6 +16,15 @@ export interface SourceEvidence {
 }
 
 export const SOURCE_CHUNK_CHARACTERS = 20000;
+export const FULL_SECTION_TARGET_CHARACTERS = 3500;
+export const FULL_SECTION_MAX_CHARACTERS = 4500;
+export const MAX_TRANSCRIPT_CHARACTERS = 240000;
+export const MAX_SOURCE_CUES = 60000;
+export const MAX_SECTION_REQUEST_CHARACTERS = 30000;
+
+export function sourceCharacterCount(cues: SourceCue[]): number {
+  return cues.map((cue) => cue.text).join("\n").length;
+}
 
 function seconds(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
@@ -222,4 +231,200 @@ export function sourcePrompt(evidence: SourceEvidence): string {
       ...(start !== undefined ? { start, end } : {}),
     })),
   );
+}
+
+/** Validate cues sent by the client for one full-document section. */
+export function readSourceCues(
+  value: unknown,
+  maximum = MAX_SECTION_REQUEST_CHARACTERS,
+): SourceCue[] {
+  if (!Array.isArray(value) || value.length > MAX_SOURCE_CUES)
+    throw new Error("本次来源片段数量无效，请重新整理完整文档。");
+  const cues: SourceCue[] = [];
+  const ids = new Set<string>();
+  let characters = 0;
+  for (const row of value) {
+    if (!row || typeof row !== "object" || Array.isArray(row))
+      throw new Error("本次来源片段格式无效，请重新整理完整文档。");
+    const item = row as Record<string, unknown>;
+    if (
+      typeof item.id !== "string" ||
+      !/^[1-9]\d{0,5}$/.test(item.id) ||
+      ids.has(item.id) ||
+      typeof item.text !== "string" ||
+      !item.text.trim()
+    )
+      throw new Error("本次来源片段格式无效，请重新整理完整文档。");
+    characters += item.text.length;
+    if (characters > maximum)
+      throw new Error("本次来源片段超出单段整理范围，请重新分段。");
+    const cue: SourceCue = { id: item.id, text: item.text };
+    if (seconds(item.start) !== undefined) cue.start = item.start as number;
+    if (
+      seconds(item.end) !== undefined &&
+      (cue.start === undefined || (item.end as number) >= cue.start)
+    )
+      cue.end = item.end as number;
+    cues.push(cue);
+    ids.add(cue.id);
+  }
+  if (!cues.length)
+    throw new Error("本次来源没有可分析的文字，请检查字幕后重试。");
+  return cues;
+}
+
+/** Re-number cues and split very long blocks so each model request stays bounded. */
+export function normalizeFullSourceCues(
+  cues: SourceCue[],
+  maximum = FULL_SECTION_MAX_CHARACTERS,
+): SourceCue[] {
+  const normalized: SourceCue[] = [];
+  let nextId = 1;
+  for (const cue of cues) {
+    const text = cue.text.trim();
+    if (!text) continue;
+    if (text.length <= maximum) {
+      normalized.push({
+        id: String(nextId++),
+        text,
+        ...(cue.start !== undefined ? { start: cue.start } : {}),
+        ...(cue.end !== undefined ? { end: cue.end } : {}),
+      });
+      continue;
+    }
+    for (let offset = 0; offset < text.length; offset += maximum) {
+      const part = text.slice(offset, offset + maximum);
+      const first = offset === 0;
+      const last = offset + maximum >= text.length;
+      normalized.push({
+        id: String(nextId++),
+        text: part,
+        ...(first && cue.start !== undefined ? { start: cue.start } : {}),
+        ...(last && cue.end !== undefined ? { end: cue.end } : {}),
+      });
+    }
+  }
+  if (!normalized.length)
+    throw new Error("字幕中没有可整理的文字，请检查内容后重试。");
+  if (normalized.length > MAX_SOURCE_CUES)
+    throw new Error(
+      `字幕片段过多（${normalized.length} 条），请减少空行后重新粘贴，或分段整理。`,
+    );
+  const characters = sourceCharacterCount(normalized);
+  if (characters > MAX_TRANSCRIPT_CHARACTERS)
+    throw new Error(
+      `本次字幕共 ${characters} 字符，超过完整整理上限 ${MAX_TRANSCRIPT_CHARACTERS} 字符。请分段粘贴后分别整理。`,
+    );
+  return normalized;
+}
+
+/** Split normalized cues into ordered model requests without dropping or duplicating text. */
+export function chunkSourceCues(
+  cues: SourceCue[],
+  target = FULL_SECTION_TARGET_CHARACTERS,
+  maximum = FULL_SECTION_MAX_CHARACTERS,
+): SourceCue[][] {
+  if (!Number.isSafeInteger(target) || target < 1000)
+    throw new Error("分段大小无效。");
+  if (!Number.isSafeInteger(maximum) || maximum < target)
+    throw new Error("分段上限无效。");
+  const chunks: SourceCue[][] = [];
+  let current: SourceCue[] = [];
+  let characters = 0;
+  for (const cue of cues) {
+    if (cue.text.length > maximum)
+      throw new Error("存在超长字幕片段，请重新读取字幕后重试。");
+    const addition = cue.text.length + (current.length ? 1 : 0);
+    if (current.length && characters + addition > maximum) {
+      chunks.push(current);
+      current = [];
+      characters = 0;
+    }
+    current.push(cue);
+    characters += cue.text.length + (current.length > 1 ? 1 : 0);
+    if (characters >= target) {
+      chunks.push(current);
+      current = [];
+      characters = 0;
+    }
+  }
+  if (current.length) chunks.push(current);
+  if (!chunks.length) throw new Error("字幕中没有可整理的文字。");
+  return chunks;
+}
+
+/** Full evidence keeps every supplied cue so every citation and the export can be checked. */
+export function buildFullEvidence(
+  cues: SourceCue[],
+  kind: SourceEvidence["kind"],
+  label: string,
+): SourceEvidence {
+  const total = sourceCharacterCount(cues);
+  if (!total) throw new Error("字幕中没有可分析的文字，请检查内容后重试。");
+  if (cues.length > MAX_SOURCE_CUES)
+    throw new Error(
+      `字幕片段过多（${cues.length} 条），请减少空行后重试，或分段整理。`,
+    );
+  if (total > MAX_TRANSCRIPT_CHARACTERS)
+    throw new Error(
+      `本次字幕共 ${total} 字符，超过完整整理上限 ${MAX_TRANSCRIPT_CHARACTERS} 字符。`,
+    );
+  return {
+    kind,
+    label,
+    coverage: "full",
+    totalCharacters: total,
+    analyzedCharacters: total,
+    limitation:
+      "已整理当前所提供的全部字幕；字幕是否覆盖整段视频仍取决于来源，且未核验视频画面。",
+    cues,
+  };
+}
+
+/** Evidence sent for one section; ids stay global so citations remain unique in the final document. */
+export function buildFullSectionEvidence(
+  cues: SourceCue[],
+  kind: SourceEvidence["kind"],
+  label: string,
+  index: number,
+  totalSections: number,
+): SourceEvidence {
+  const total = sourceCharacterCount(cues);
+  if (!total) throw new Error("本段没有可分析的文字。");
+  const single = totalSections === 1;
+  return {
+    kind,
+    label,
+    coverage: single ? "full" : "partial",
+    totalCharacters: total,
+    analyzedCharacters: total,
+    limitation: single
+      ? "本次整理覆盖当前提供的全部字幕。"
+      : `本段是完整文档的第 ${index}/${totalSections} 段，仅覆盖本段所提供的字幕。`,
+    cues,
+  };
+}
+
+export function cuesToPlainText(cues: SourceCue[]): string {
+  return cues.map((cue) => cue.text).join("\n");
+}
+
+function srtClock(secondsValue: number): string {
+  const milliseconds = Math.max(0, Math.round(secondsValue * 1000));
+  const hours = Math.floor(milliseconds / 3600000);
+  const minutes = Math.floor((milliseconds % 3600000) / 60000);
+  const seconds = Math.floor((milliseconds % 60000) / 1000);
+  const millis = milliseconds % 1000;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")},${String(millis).padStart(3, "0")}`;
+}
+
+/** Export SRT only when every cue has real timing; never invent timestamps. */
+export function cuesToSrt(cues: SourceCue[]): string | undefined {
+  if (!cues.length || cues.some((cue) => cue.start === undefined || cue.end === undefined)) return;
+  return cues
+    .map(
+      (cue, index) =>
+        `${index + 1}\n${srtClock(cue.start!)} --> ${srtClock(cue.end!)}\n${cue.text}`,
+    )
+    .join("\n\n");
 }

@@ -1,51 +1,212 @@
-import { parseVideoLink, trustedAsset } from './video-url'
-import { biliMetadata, BiliVideo } from './bili-metadata'
+import { parseVideoLink, trustedAsset } from "./video-url";
+import { biliMetadata, BiliVideo } from "./bili-metadata";
 
 // Bilibili's public JSONP API can be reached from the viewer's network when cloud IPs are blocked.
 // URLs are fixed to the official API; only validated video identifiers and callback names are inserted.
 function jsonp<T>(path: string, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
-    if (signal.aborted) { reject(new Error('请求已停止')); return }
-    const callback = `bili_${crypto.randomUUID().replace(/-/g, '')}`
-    const scope = window as unknown as Record<string, unknown>
-    const script = document.createElement('script')
-    const cleanup = () => { clearTimeout(timer); script.remove(); delete scope[callback]; signal.removeEventListener('abort', stopped) }
-    const stopped = () => { cleanup(); reject(new Error('请求已停止')) }
-    const timer = setTimeout(() => { cleanup(); reject(new Error('B 站浏览器解析超时，请稍后重试')) }, 10000)
-    scope[callback] = (result: { code: number; message?: string; data?: T } | null) => {
-      cleanup()
-      if (!result || result.code !== 0 || !result.data) { reject(new Error(result?.code === -404 ? '视频不存在或不可公开访问' : `B 站：${result?.message || '暂时不可用'}`)); return }
-      resolve(result.data)
+    if (signal.aborted) {
+      reject(new Error("请求已停止"));
+      return;
     }
-    script.onerror = () => { cleanup(); reject(new Error('浏览器暂时无法访问 B 站，请检查网络后重试')) }
-    script.src = `https://api.bilibili.com${path}&jsonp=jsonp&callback=${callback}`
-    signal.addEventListener('abort', stopped, { once: true })
-    document.head.appendChild(script)
-  })
+    const callback = `bili_${crypto.randomUUID().replace(/-/g, "")}`;
+    const scope = window as unknown as Record<string, unknown>;
+    const script = document.createElement("script");
+    const cleanup = () => {
+      clearTimeout(timer);
+      script.remove();
+      delete scope[callback];
+      signal.removeEventListener("abort", stopped);
+    };
+    const stopped = () => {
+      cleanup();
+      reject(new Error("请求已停止"));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("B 站浏览器解析超时，请稍后重试"));
+    }, 10000);
+    scope[callback] = (
+      result: { code: number; message?: string; data?: T } | null,
+    ) => {
+      cleanup();
+      if (!result || result.code !== 0 || !result.data) {
+        reject(
+          new Error(
+            result?.code === -404
+              ? "视频不存在或不可公开访问"
+              : `B 站：${result?.message || "暂时不可用"}`,
+          ),
+        );
+        return;
+      }
+      resolve(result.data);
+    };
+    script.onerror = () => {
+      cleanup();
+      reject(new Error("浏览器暂时无法访问 B 站，请检查网络后重试"));
+    };
+    script.src = `https://api.bilibili.com${path}&jsonp=jsonp&callback=${callback}`;
+    signal.addEventListener("abort", stopped, { once: true });
+    document.head.appendChild(script);
+  });
 }
 
-export async function browserSubtitles(bvid: string, cid: number, signal: AbortSignal): Promise<{ lan: string; lan_doc: string; subtitle_url: string }[]> {
-  if (!/^BV[0-9A-Za-z]{10}$/.test(bvid) || !Number.isSafeInteger(cid) || cid < 1) throw new Error('视频或当前分 P 信息无效，请刷新来源后重试')
-  const player = await jsonp<{ subtitle?: { subtitles?: { lan: string; lan_doc: string; subtitle_url: string }[] } }>(`/x/player/v2?bvid=${bvid}&cid=${cid}`, signal)
-  if (typeof player !== 'object' || Array.isArray(player) || (player.subtitle && typeof player.subtitle !== 'object')) throw new Error('平台字幕信息格式异常，请刷新来源后重试')
-  const subtitles = player.subtitle?.subtitles
-  if (subtitles === undefined || subtitles === null) return []
-  if (!Array.isArray(subtitles)) throw new Error('平台字幕信息格式异常，请刷新来源后重试')
-  return subtitles.flatMap(subtitle => {
-    if (!subtitle || typeof subtitle.lan !== 'string' || typeof subtitle.lan_doc !== 'string' || typeof subtitle.subtitle_url !== 'string') return []
-    try { return [{ lan: subtitle.lan, lan_doc: subtitle.lan_doc, subtitle_url: trustedAsset(subtitle.subtitle_url, 'subtitle').href }] } catch { return [] }
-  })
+export async function browserSubtitles(
+  bvid: string,
+  cid: number,
+  signal: AbortSignal,
+): Promise<{ lan: string; lan_doc: string; subtitle_url: string }[]> {
+  if (
+    !/^BV[0-9A-Za-z]{10}$/.test(bvid) ||
+    !Number.isSafeInteger(cid) ||
+    cid < 1
+  )
+    throw new Error("视频或当前分 P 信息无效，请刷新来源后重试");
+  const player = await jsonp<{
+    subtitle?: {
+      subtitles?: { lan: string; lan_doc: string; subtitle_url: string }[];
+    };
+  }>(`/x/player/v2?bvid=${bvid}&cid=${cid}`, signal);
+  if (
+    typeof player !== "object" ||
+    Array.isArray(player) ||
+    (player.subtitle && typeof player.subtitle !== "object")
+  )
+    throw new Error("平台字幕信息格式异常，请刷新来源后重试");
+  const subtitles = player.subtitle?.subtitles;
+  if (subtitles === undefined || subtitles === null) return [];
+  if (!Array.isArray(subtitles))
+    throw new Error("平台字幕信息格式异常，请刷新来源后重试");
+  return subtitles.flatMap((subtitle) => {
+    if (
+      !subtitle ||
+      typeof subtitle.lan !== "string" ||
+      typeof subtitle.lan_doc !== "string" ||
+      typeof subtitle.subtitle_url !== "string"
+    )
+      return [];
+    try {
+      return [
+        {
+          lan: subtitle.lan,
+          lan_doc: subtitle.lan_doc,
+          subtitle_url: trustedAsset(subtitle.subtitle_url, "subtitle").href,
+        },
+      ];
+    } catch {
+      return [];
+    }
+  });
 }
 
 export async function browserVideoInfo(input: string, signal: AbortSignal) {
-  const link = parseVideoLink(input)
-  if (link.platform !== 'bilibili' || link.short) throw new Error('请使用完整 B 站视频链接或 BV 号')
-  const data = await jsonp<BiliVideo>(`/x/web-interface/view?${link.bvid ? `bvid=${link.bvid}` : `aid=${link.aid}`}`, signal)
-  const info = biliMetadata(data, link.page)
+  const link = parseVideoLink(input);
+  if (link.platform !== "bilibili" || link.short)
+    throw new Error("请使用完整 B 站视频链接或 BV 号");
+  const data = await jsonp<BiliVideo>(
+    `/x/web-interface/view?${link.bvid ? `bvid=${link.bvid}` : `aid=${link.aid}`}`,
+    signal,
+  );
+  const info = biliMetadata(data, link.page);
   try {
-    info.subtitles = await browserSubtitles(info.bvid, info.cid, signal)
-    info.hasSubtitles = info.subtitles.length > 0
-    if (!info.hasSubtitles) info.subtitleNotice = '当前访问条件下未取得平台字幕，可粘贴这一分 P 的实际字幕文本。'
-  } catch { if (signal.aborted) throw new Error('请求已停止'); info.subtitleNotice = '浏览器暂时无法查询平台字幕，可刷新来源重试，或粘贴这一分 P 的实际字幕文本。' }
-  return info
+    info.subtitles = await browserSubtitles(info.bvid, info.cid, signal);
+    info.hasSubtitles = info.subtitles.length > 0;
+    if (!info.hasSubtitles)
+      info.subtitleNotice =
+        "当前访问条件下未取得平台字幕，可粘贴这一分 P 的实际字幕文本。";
+  } catch {
+    if (signal.aborted) throw new Error("请求已停止");
+    info.subtitleNotice =
+      "浏览器暂时无法查询平台字幕，可刷新来源重试，或粘贴这一分 P 的实际字幕文本。";
+  }
+  return info;
+}
+
+export interface BrowserMedia {
+  url: string;
+  backups: string[];
+  size: number;
+  quality: number;
+  parts: number;
+  format: string;
+}
+
+interface PlayData {
+  durl?: { url?: string; backup_url?: string[] | null; size?: number }[];
+  quality?: number;
+  format?: string;
+}
+
+/**
+ * Ask Bilibili's public JSONP endpoint for a media URL generated for this browser's
+ * network, then let the browser download the MP4 directly from the CDN. This avoids
+ * proxying video bytes through a serverless response limit.
+ */
+export async function browserMedia(
+  bvid: string,
+  cid: number,
+  qn: number,
+  signal: AbortSignal,
+): Promise<BrowserMedia> {
+  if (
+    !/^BV[0-9A-Za-z]{10}$/.test(bvid) ||
+    !Number.isSafeInteger(cid) ||
+    cid < 1
+  )
+    throw new Error("视频或当前分 P 信息无效，请刷新视频后重试");
+  const quality = [16, 32, 64].includes(Number(qn)) ? Number(qn) : 32;
+  const data = await jsonp<PlayData>(
+    `/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=${quality}&fnval=1&fnver=0&fourk=0&platform=html5`,
+    signal,
+  );
+  if (!data || typeof data !== "object" || Array.isArray(data))
+    throw new Error("平台返回的下载信息格式异常，请稍后重试");
+  const parts = Array.isArray(data.durl) ? data.durl : [];
+  if (!parts.length)
+    throw new Error(
+      "该视频需要登录、合并音视频或转换格式，网页直接保存不可用。",
+    );
+  if (parts.length !== 1)
+    throw new Error("视频包含多个片段，请使用本机下载保存完整视频。");
+  const first = parts[0];
+  if (!first || typeof first.url !== "string")
+    throw new Error("平台没有返回可直接保存的视频地址。");
+  const asset = trustedAsset(first.url, "media");
+  if (!asset.pathname.toLowerCase().endsWith(".mp4"))
+    throw new Error("平台没有提供独立 MP4，请使用本机下载转换格式。");
+  const url = asset.href;
+  const backups: string[] = [];
+  if (Array.isArray(first.backup_url)) {
+    for (const backup of first.backup_url) {
+      if (typeof backup !== "string") continue;
+      try {
+        const asset = trustedAsset(backup, "media");
+        if (
+          asset.pathname.toLowerCase().endsWith(".mp4") &&
+          asset.href !== url &&
+          !backups.includes(asset.href)
+        )
+          backups.push(asset.href);
+      } catch {
+        /* Ignore unsupported backup hosts. */
+      }
+    }
+  }
+  return {
+    url,
+    backups,
+    size:
+      typeof first.size === "number" &&
+      Number.isSafeInteger(first.size) &&
+      first.size > 0
+        ? first.size
+        : 0,
+    quality:
+      typeof data.quality === "number" && data.quality > 0
+        ? data.quality
+        : quality,
+    parts: parts.length,
+    format: typeof data.format === "string" ? data.format : "",
+  };
 }

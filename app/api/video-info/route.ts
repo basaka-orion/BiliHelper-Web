@@ -12,7 +12,9 @@ async function resolveShort(url: string) {
     const location = response.headers.get('location')
     await response.body?.cancel()
     if (!location) return parseVideoLink(url)
-    const next = parseVideoLink(new URL(location, url).href)
+    let next
+    try { next = parseVideoLink(new URL(location, url).href) }
+    catch (e) { throw new HttpError((e as Error).message, 400) }
     if (next.platform !== 'bilibili') throw new HttpError('短链接没有指向 B 站视频', 400)
     if (!next.short) return next
     url = next.url

@@ -13,6 +13,8 @@ try {
       "lib/bili-metadata.ts",
       "lib/markdown.ts",
       "lib/learning-source.ts",
+      "lib/full-document.ts",
+      "lib/download-transfer.ts",
       "lib/workspace.ts",
       "lib/refresh-video-source.ts",
       "--target",
@@ -34,6 +36,8 @@ try {
         "tests/source.cjs",
         "tests/workspace.cjs",
         "tests/refresh.cjs",
+        "tests/full-document.cjs",
+        "tests/download-transfer.cjs",
       ],
       { stdio: "inherit", env: { ...process.env, BILI_TEST_BUILD: directory } },
     );
