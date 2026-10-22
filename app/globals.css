@@ -759,6 +759,30 @@ code {
 .note-mode-switch button:disabled {
   opacity: 0.6;
 }
+.mode-new {
+  margin-left: 4px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #b7a4ff22;
+  color: #c8baff;
+  font-size: 10px;
+}
+.mode-result-notice {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  margin: 12px 0;
+}
+.note-content.article-prose {
+  line-height: 2;
+}
+.note-content.article-prose p {
+  margin: 0 0 1.35em;
+  overflow-wrap: anywhere;
+}
+.note-content.article-prose > :first-child {
+  margin-top: 0;
+}
 .job-count {
   font-size: 10px;
   color: var(--muted);
@@ -1546,6 +1570,7 @@ code {
   }
   .note-mode-switch button {
     min-width: 0;
+    flex-basis: 100%;
     padding: 8px 10px;
     font-size: 11px;
   }

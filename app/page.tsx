@@ -49,7 +49,9 @@ import {
   type SourceEvidence,
 } from "../lib/learning-source";
 import {
+  assembleArticle,
   assembleFullDocument,
+  assemblePartialArticle,
   assemblePartialDocument,
   markdownFileName,
   type FullDocumentSection,
@@ -80,10 +82,15 @@ function noteState(document?: LearningDocument) {
     : document?.draft?.text || document?.generationState === "interrupted"
       ? "未完成"
       : document?.note
-        ? document.note.mode === "full"
-          ? "完整文档"
+        ? document.note.mode === "article"
+          ? "完整文稿"
+          : document.note.mode === "full"
+          ? "学习笔记"
           : "有笔记"
         : "未整理";
+}
+function modeLabel(mode?: LearningDocument["noteMode"]) {
+  return mode === "article" ? "完整文稿" : mode === "full" ? "学习笔记" : "简短摘要";
 }
 function coverage(evidence?: SourceEvidence) {
   return evidence?.coverage === "full"
@@ -163,7 +170,7 @@ export default function Home() {
   const jobRef = useRef<{
     id: string;
     controller: AbortController;
-    mode?: "study" | "full";
+    mode?: "study" | "full" | "article";
   } | null>(null);
   const analyzeRef = useRef<AbortController>();
   const contentRef = useRef<HTMLElement>(null);
@@ -189,8 +196,12 @@ export default function Home() {
     : undefined;
   const generationError = active?.draft?.error || active?.fullJob?.error;
   const noteMode = active?.noteMode || "full";
+  const longForm = noteMode !== "study";
+  const fullJobMode = active?.fullJob?.mode || "full";
   const fullSections = active?.fullJob?.sections || [];
-  const canResumeFull = noteMode === "full" && !!active?.fullJob;
+  const canResumeFull = longForm && !!active?.fullJob && fullJobMode === noteMode;
+  const outputName = modeLabel(noteMode);
+  const shownArticle = shownNote?.mode === "article";
   const needsSource =
     !!active &&
     !active.transcript.trim() &&
@@ -211,10 +222,8 @@ export default function Home() {
       : currentEvidence?.kind !== "manual"
         ? currentEvidence?.totalCharacters || 0
         : 0);
-  const sourceCues =
-    shownNote?.evidence?.cues?.length
-      ? shownNote.evidence.cues
-      : active?.fullJob?.source.cues || [];
+  const sourceEvidence = shownNote?.evidence || active?.fullJob?.source || active?.draft?.evidence;
+  const sourceCues = sourceEvidence?.cues || [];
   const matchingCues = sourceCues.filter(
     (cue) => !sourceSearch || cue.text.includes(sourceSearch),
   );
@@ -402,22 +411,32 @@ export default function Home() {
     live?: FullDocumentSection,
   ) {
     const all = (live ? [...sections, live] : sections)
-      .filter((section) => section.markdown.trim())
+      .filter((section) => section.markdown.trim() || section.omitted)
       .sort((a, b) => a.index - b.index);
-    if (!all.length) return "";
-    return assemblePartialDocument({
-      title: snapshot.video.title,
-      partTitle: partName(snapshot.video),
-      videoUrl: snapshot.video.url,
-      sourceLabel: source.label,
-      totalCharacters:
-        source.totalCharacters || sourceCharacterCount(source.cues),
-      sections: all,
-      generatedAt: Date.now(),
-      platform: snapshot.video.platform,
-      page: snapshot.video.selectedPage || 1,
-      pageCount: snapshot.video.pages?.length || 1,
-    });
+    if (!all.some((section) => section.markdown.trim())) return "";
+    const assemble = snapshot.noteMode === "article"
+      ? assemblePartialArticle
+      : assemblePartialDocument;
+    try {
+      return assemble({
+        title: snapshot.video.title,
+        partTitle: partName(snapshot.video),
+        videoUrl: snapshot.video.url,
+        sourceLabel: source.label,
+        totalCharacters:
+          source.totalCharacters || sourceCharacterCount(source.cues),
+        sections: all,
+        generatedAt: Date.now(),
+        platform: snapshot.video.platform,
+        page: snapshot.video.selectedPage || 1,
+        pageCount: snapshot.video.pages?.length || 1,
+      });
+    } catch {
+      // Streaming may temporarily contain only a heading or an unfinished code fence.
+      // Keep the received text recoverable; only the final assembly decides completion.
+      return all.filter((section) => !section.omitted).map((section) => section.markdown).join("\n\n") +
+        "\n\n> 内容尚未整理完成，以上是已收到的部分。";
+    }
   }
 
   async function acquireFullSource(
@@ -524,6 +543,8 @@ export default function Home() {
     total: number,
     controller: AbortController,
     onText: (text: string) => void,
+    previousContext = "",
+    nextContext = "",
   ) {
     setJob({
       id: snapshot.id,
@@ -536,7 +557,8 @@ export default function Home() {
       headers: { "Content-Type": "application/json" },
       signal: controller.signal,
       body: JSON.stringify({
-        mode: "full-section",
+        mode: snapshot.noteMode === "article" ? "article-section" : "full-section",
+        ...(snapshot.noteMode === "article" ? { previousContext, nextContext } : {}),
         videoUrl: snapshot.video.url,
         title: `${snapshot.video.title} · P${snapshot.video.selectedPage || 1} ${partName(snapshot.video)}`,
         sourceCues: chunk,
@@ -560,6 +582,7 @@ export default function Home() {
     let output = "";
     let warning = "";
     let completed = false;
+    let omitted = false;
     await readSSE(response.body, (payload) => {
       if (controller.signal.aborted) return;
       if (payload === "[DONE]") {
@@ -573,6 +596,7 @@ export default function Home() {
         return;
       }
       if (event.error) throw new Error(event.error);
+      if (event.noContent && snapshot.noteMode === "article") omitted = true;
       if (event.warning) warning = event.warning;
       if (event.status)
         setJob({
@@ -590,13 +614,19 @@ export default function Home() {
       throw new Error(
         `第 ${index + 1} 段未完成：${warning} 已完成的其他段落会保留，可继续重试这一段。`,
       );
-    if (!completed || !output.trim())
+    if (omitted && output.trim())
+      throw new Error(`第 ${index + 1} 段文稿状态异常，请重试。`);
+    if (!completed || (!output.trim() && !omitted))
       throw new Error(`第 ${index + 1} 段没有返回内容，请重试。`);
-    return { text: output, warning };
+    return { text: output, warning, omitted };
   }
 
   async function generateFull(resume = false) {
     if (!active || jobRef.current) return;
+    setNotice("");
+    const writingMode = active.noteMode === "article" ? "article" : "full";
+    const writingName = modeLabel(writingMode);
+    resume = resume && (active.fullJob?.mode || "full") === writingMode;
     if (needsSource && !(resume && active.fullJob?.source)) {
       setSourceOpen(true);
       return;
@@ -604,9 +634,9 @@ export default function Home() {
     const snapshot = active,
       id = active.id,
       controller = new AbortController();
-    jobRef.current = { id, controller, mode: "full" };
+    jobRef.current = { id, controller, mode: writingMode };
     setShowPrevious(false);
-    const startedAt = snapshot.fullJob?.startedAt || Date.now();
+    const startedAt = (resume ? snapshot.fullJob?.startedAt : undefined) || Date.now();
     let source = resume ? snapshot.fullJob?.source : undefined;
     let sections: FullDocumentSection[] = resume
       ? [...(snapshot.fullJob?.sections || [])]
@@ -616,7 +646,7 @@ export default function Home() {
     let unfinishedSection: FullDocumentSection | undefined;
     setJob({
       id,
-      status: resume ? "继续完整整理…" : "准备完整整理…",
+      status: `${resume ? "继续" : "准备生成"}${writingName}…`,
       done: sections.length,
       total: totalSections,
     });
@@ -624,7 +654,7 @@ export default function Home() {
       if (!resume || !source) {
         updateDocument(id, (value) => ({
           ...value,
-          noteMode: "full",
+          noteMode: writingMode,
           generationState: "running",
           note:
             value.note ||
@@ -640,7 +670,7 @@ export default function Home() {
             source: "",
             status: "partial",
             generatedAt: startedAt,
-            mode: "full",
+            mode: writingMode,
             sectionCount: 0,
           },
         }));
@@ -653,9 +683,10 @@ export default function Home() {
           );
         updateDocument(id, (value) => ({
           ...value,
-          noteMode: "full",
+          noteMode: writingMode,
           generationState: "running",
           fullJob: {
+            mode: writingMode,
             status: "running",
             source: source!,
             totalCharacters:
@@ -670,7 +701,7 @@ export default function Home() {
             source: source!.label,
             status: "partial",
             generatedAt: startedAt,
-            mode: "full",
+            mode: writingMode,
             sectionCount: 0,
           },
         }));
@@ -682,11 +713,12 @@ export default function Home() {
         }
         updateDocument(id, (value) => ({
           ...value,
-          noteMode: "full",
+          noteMode: writingMode,
           generationState: "running",
           fullJob: value.fullJob
             ? {
                 ...value.fullJob,
+                mode: writingMode,
                 status: "running",
                 error: undefined,
                 totalSections,
@@ -699,7 +731,7 @@ export default function Home() {
             source: source!.label,
             status: "partial",
             generatedAt: startedAt,
-            mode: "full",
+            mode: writingMode,
             sectionCount: sections.length,
           },
         }));
@@ -740,6 +772,8 @@ export default function Home() {
                 : value,
             );
           },
+          sections.slice().reverse().find((section) => section.markdown.trim())?.markdown.slice(-2400) || "",
+          (chunks[index + 1] || []).map((cue) => cue.text).join("\n").slice(0, 800),
         );
         sections = [
           ...sections,
@@ -747,6 +781,7 @@ export default function Home() {
             index,
             markdown: section.text,
             cueIds: chunks[index].map((cue) => cue.id),
+            ...(section.omitted ? { omitted: true as const } : {}),
             ...(section.warning ? { warning: section.warning } : {}),
           },
         ];
@@ -754,6 +789,7 @@ export default function Home() {
         updateDocument(id, (value) => ({
           ...value,
           fullJob: {
+            mode: writingMode,
             status: "running",
             source: fullSource,
             totalCharacters:
@@ -769,7 +805,7 @@ export default function Home() {
             source: fullSource.label,
             status: "partial",
             generatedAt: startedAt,
-            mode: "full",
+            mode: writingMode,
             sectionCount: sections.length,
           },
         }));
@@ -783,7 +819,8 @@ export default function Home() {
       const warnings = sections
         .filter((section) => section.warning)
         .map((section) => `第 ${section.index + 1} 段：${section.warning}`);
-      const finalText = assembleFullDocument({
+      const assemble = writingMode === "article" ? assembleArticle : assembleFullDocument;
+      const finalText = assemble({
         title: snapshot.video.title,
         partTitle: partName(snapshot.video),
         videoUrl: snapshot.video.url,
@@ -807,7 +844,7 @@ export default function Home() {
         status: warnings.length ? "partial" : "complete",
         error: warnings.length ? warnings.join("；") : undefined,
         generatedAt: startedAt,
-        mode: "full",
+        mode: writingMode,
         sectionCount: sections.length,
       };
       updateDocument(id, (value) => ({
@@ -819,13 +856,14 @@ export default function Home() {
         generationState: "idle",
         updatedAt: Date.now(),
       }));
-      setNotice(`完整文档已整理完成：共 ${sections.length} 段。`);
+      setNotice(`${writingName}已生成完成。`);
     } catch (error) {
+      const noArticleContent = writingMode === "article" && totalSections > 0 && sections.length === totalSections && sections.every((section) => section.omitted);
       const message = controller.signal.aborted
-        ? "完整整理已停止，已完成的部分已保存。"
+        ? `${writingName}已停止，已完成的部分已保存。`
         : error instanceof Error
           ? error.message
-          : "完整整理失败，请重试。";
+          : `${writingName}生成失败，请重试。`;
       const preview = source
         ? partialFullDocument(snapshot, source, sections, unfinishedSection)
         : sections.length
@@ -834,8 +872,9 @@ export default function Home() {
       updateDocument(id, (value) => ({
         ...value,
         generationState: "interrupted",
-        fullJob: source
+        fullJob: noArticleContent ? undefined : source
           ? {
+              mode: writingMode,
               status: controller.signal.aborted ? "paused" : "error",
               source,
               totalCharacters:
@@ -853,8 +892,9 @@ export default function Home() {
           status: "partial",
           error: message,
           generatedAt: startedAt,
-          mode: "full",
+          mode: writingMode,
           sectionCount: sections.length,
+          ...(noArticleContent && source ? { evidence: source } : {}),
         },
       }));
     } finally {
@@ -868,6 +908,7 @@ export default function Home() {
 
   async function generate() {
     if (!active || jobRef.current || needsSource) return;
+    setNotice("");
     if (active.transcript.trim() && active.transcript.trim().length < 30) {
       setSourceOpen(true);
       setNotice("请粘贴至少 30 个字符的实际视频内容。");
@@ -1031,10 +1072,15 @@ export default function Home() {
     }
   }
 
-  function exportNote(item = active, note = shownNote) {
+  function exportNote(item = active, note = shownNote, includeArticleSource = false) {
     if (!item) return;
     const title = partName(item.video);
-    const full = note?.mode === "full";
+    const article = note?.mode === "article";
+    if (article && !includeArticleSource) {
+      saveTextFile(tutorialMarkdown(note.text), markdownFileName(title, "完整文稿"));
+      return;
+    }
+    const full = note?.mode === "full" || article;
     const evidence = note?.evidence || item.fullJob?.source;
     const cues = evidence?.cues || [];
     const markdown = tutorialMarkdown(note?.text || "").replace(
@@ -1077,7 +1123,7 @@ export default function Home() {
       `来源：${item.video.url}`,
       `依据：${note?.source || "未生成"}`,
       `覆盖：${full && note?.status === "partial" ? "已取得原文，正文尚未全部整理" : coverage(evidence)}`,
-      full ? `整理方式：完整文档 · ${note?.sectionCount || 0} 段` : "整理方式：学习笔记",
+      full ? `整理方式：${article ? "完整文稿" : "学习笔记"} · ${note?.sectionCount || 0} 段` : "整理方式：简短摘要",
       note?.generatedAt
         ? `生成时间：${new Date(note.generatedAt).toLocaleString("zh-CN")}`
         : "",
@@ -1100,7 +1146,7 @@ export default function Home() {
     }`;
     saveTextFile(
       text,
-      markdownFileName(title, full ? "完整文档" : "学习笔记"),
+      markdownFileName(title, article ? "完整文稿-附原文" : full ? "完整文档" : "学习笔记"),
     );
   }
   function exportCourse(source = active || document) {
@@ -1358,9 +1404,9 @@ export default function Home() {
                   留给下次的自己。
                 </h1>
                 <p className="landing-description">
-                  把教程整理成有依据的完整文档。
+                  把视频全篇整理成一篇完整文章。
                   <br />
-                  逐段覆盖全部字幕，留下理解，下次回来继续。
+                  保留讲述、例子和细节，只删废话与重复。
                 </p>
                 <form
                   className="import-form"
@@ -1419,15 +1465,15 @@ export default function Home() {
                   </button>
                 )}
               </div>
-              <div className="note-preview" aria-label="文档结构预览">
+              <div className="note-preview" aria-label="完整文稿功能示意">
                 <div className="preview-top">
                   <span className="preview-dots">● ● ●</span>
-                  <span>文档结构预览</span>
+                  <span>完整文稿 · 功能示意</span>
                 </div>
                 <div className="preview-page">
                   <div className="preview-label">
                     <FileText size={14} />
-                    每一节，都有自己的完整文档
+                    从整段讲述，到一篇文章
                   </div>
                   <h2>
                     从看过，
@@ -1441,15 +1487,15 @@ export default function Home() {
                   <div className="preview-section">
                     <span>01</span>
                     <div>
-                      <h3>全文脉络</h3>
-                      <p>按原文顺序整理全部内容。</p>
+                      <h3>完整讲述，连贯成文</h3>
+                      <p>保留原来的展开、论证和例子。</p>
                     </div>
                   </div>
                   <div className="preview-section">
                     <span>02</span>
                     <div>
-                      <h3>关键知识与跟做步骤</h3>
-                      <p>每条要点都能回到原文核对。</p>
+                      <h3>只做必要的编辑</h3>
+                      <p>去掉废话和重复，留下每一处实质细节。</p>
                     </div>
                   </div>
                   <div className="preview-memo">
@@ -1569,7 +1615,7 @@ export default function Home() {
                   >
                     <ShieldCheck size={16} />
                     <span>
-                      {shownNote?.source ||
+                      {shownNote?.source || sourceEvidence?.label ||
                         (active.transcript.trim()
                           ? "你提供的字幕文本"
                           : active.video.hasSubtitles
@@ -1580,7 +1626,7 @@ export default function Home() {
                       <small>
                         {shownNote
                           ? `${active.fullJob ? "已读取原文，正文尚未全部完成" : coverage(shownNote.evidence)}${
-                              shownNote.mode === "full"
+                              shownNote.mode === "full" || shownNote.mode === "article"
                                 ? active.fullJob
                                   ? ` · 已完成 ${fullSections.length}/${active.fullJob.totalSections} 段`
                                   : ` · ${shownNote.sectionCount || 0} 段`
@@ -1605,6 +1651,15 @@ export default function Home() {
                   )}
                   <div className="note-mode-switch" role="group" aria-label="整理方式">
                     <button
+                      className={noteMode === "article" ? "active" : ""}
+                      disabled={active.generationState === "running"}
+                      aria-pressed={noteMode === "article"}
+                      onClick={() => updateDocument(active.id, (value) => ({ ...value, noteMode: "article" }))}
+                    >
+                      完整文稿 <span className="mode-new">新</span>
+                      <small>全篇写成文章，只删废话和重复</small>
+                    </button>
+                    <button
                       className={noteMode === "full" ? "active" : ""}
                       disabled={active.generationState === "running"}
                       aria-pressed={noteMode === "full"}
@@ -1615,8 +1670,8 @@ export default function Home() {
                         }))
                       }
                     >
-                      全文整理
-                      <small>保留内容细节，去掉寒暄和重复</small>
+                      学习笔记
+                      <small>按主题、知识和步骤整理</small>
                     </button>
                     <button
                       className={noteMode === "study" ? "active" : ""}
@@ -1633,6 +1688,11 @@ export default function Home() {
                       <small>只看要点，每次一个片段</small>
                     </button>
                   </div>
+                  {noteMode === "article" && (
+                    <p className="small muted">
+                      完整保留优先：无法确认的删改保留原文，少量口语可能保留。
+                    </p>
+                  )}
                   <div className="document-actions">
                     <div>
                       {active.generationState === "running" ? (
@@ -1668,7 +1728,7 @@ export default function Home() {
                           onClick={() => {
                             if (needsSource && !canResumeFull) {
                               setSourceOpen(true);
-                            } else if (noteMode === "full") {
+                            } else if (longForm) {
                               generateFull(canResumeFull);
                             } else {
                               generate();
@@ -1682,12 +1742,12 @@ export default function Home() {
                           )}
                           {needsSource
                             ? "补充字幕"
-                            : noteMode === "full"
+                            : longForm
                               ? canResumeFull
                                 ? `继续整理 · ${fullSections.length}/${active.fullJob?.totalSections || "?"} 段`
-                                : shownNote?.text
-                                  ? "重新生成完整文档"
-                                  : "生成完整文档"
+                                : shownNote?.text && shownNote.mode === noteMode
+                                  ? `重新生成${outputName}`
+                                  : `生成${outputName}`
                               : shownNote?.text
                                 ? "重新生成学习笔记"
                                 : active.transcriptOffset > 0 ||
@@ -1705,17 +1765,31 @@ export default function Home() {
                       保存视频
                     </button>
                   </div>
+                  {shownNote?.text && (shownNote.mode || "study") !== noteMode && !job && (
+                    <p className="mode-result-notice">
+                      下面是已保存的{modeLabel(shownNote.mode)}。选择方式只影响下次生成；新内容生成成功后，可查看上一版。
+                    </p>
+                  )}
                   {job && job.id !== active.id && (
                     <p className="small muted">
                       另一节正在生成，完成或停止后可整理这一节。
                     </p>
                   )}
-                  {active.fullJob &&
+                  {active.fullJob && !canResumeFull && !job && (
+                    <p className="mode-result-notice">
+                      {modeLabel(fullJobMode)}还有未完成的进度。
+                      <button className="text-button" onClick={() => updateDocument(active.id, (value) => ({ ...value, noteMode: fullJobMode }))}>
+                        切回继续
+                      </button>
+                      开始新的生成会替换这份进度。
+                    </p>
+                  )}
+                  {active.fullJob && canResumeFull &&
                     active.generationState !== "running" &&
                     fullSections.length > 0 && (
                       <div className="notice full-job-notice" role="status">
                         <strong>
-                          完整文档已完成 {fullSections.length}/
+                          {outputName}已完成 {fullSections.length}/
                           {active.fullJob.totalSections} 段
                         </strong>
                         <p>
@@ -1746,7 +1820,7 @@ export default function Home() {
                   )}
                   {(generationError ||
                     active.generationState === "interrupted") &&
-                    !(active.fullJob && fullSections.length > 0) && (
+                    !(canResumeFull && fullSections.length > 0) && (
                     <div className="notice" role="alert">
                       <strong>这次生成未完成</strong>
                       <p>
@@ -1758,15 +1832,15 @@ export default function Home() {
                         disabled={!!job}
                         onClick={() => {
                           if (needsSource) setSourceOpen(true);
-                          else if (noteMode === "full")
+                          else if (longForm)
                             generateFull(canResumeFull);
                           else generate();
                         }}
                       >
                         {needsSource
                           ? "补充字幕"
-                          : noteMode === "full"
-                            ? "重试完整整理"
+                          : longForm
+                            ? `重试${outputName}`
                             : "重试"}
                       </button>
                       <button
@@ -1796,7 +1870,7 @@ export default function Home() {
                     </div>
                   )}
                   {shownNote?.text ? (
-                    <article className="note-content">
+                    <article className={`note-content${shownArticle ? " article-prose" : ""}`} aria-label={shownArticle ? "完整文稿正文" : "笔记正文"}>
                       <ReactMarkdown
                         remarkPlugins={[remarkGfm]}
                         urlTransform={(url) =>
@@ -1831,7 +1905,9 @@ export default function Home() {
                             ),
                         }}
                       >
-                        {tutorialMarkdown(shownNote.text)}
+                        {shownArticle
+                          ? tutorialMarkdown(shownNote.text).replace(/^#\s+[^\n]*\n+/, "")
+                          : tutorialMarkdown(shownNote.text)}
                       </ReactMarkdown>
                     </article>
                   ) : active.generationState === "running" ? (
@@ -1847,6 +1923,8 @@ export default function Home() {
                       <h2>
                         {needsSource
                           ? "先把这一节的内容补上"
+                          : noteMode === "article"
+                            ? "把整段讲述，写成一篇文章"
                           : noteMode === "full"
                             ? "把这一节完整整理下来"
                             : "把这一节留下来"}
@@ -1854,13 +1932,15 @@ export default function Home() {
                       <p>
                         {needsSource
                           ? "目前无法读取这一节的字幕。粘贴实际字幕或转录文本，就能继续整理。"
+                          : noteMode === "article"
+                            ? "保留原来的讲述、例子、推导和所有细节，只去掉寒暄、广告与重复。长视频逐段处理，最后连成一篇完整文稿。"
                           : noteMode === "full"
                             ? "逐段整理全部字幕，生成一份完整、可核对、可导出的 Markdown 文档。你的备注会自动保存在这台设备。"
                             : "整理本节目的、关键知识和原文中的步骤。你的笔记与备注会自动保存在这台设备。"}
                       </p>
                       <div>
                         <span>
-                          {noteMode === "full" ? "覆盖全部字幕" : "有依据的要点"}
+                          {longForm ? "覆盖全部字幕" : "有依据的要点"}
                         </span>
                         <span>可恢复的笔记</span>
                         <span>自己的理解</span>
@@ -1870,7 +1950,9 @@ export default function Home() {
                   {shownNote?.text && (
                     <div className="note-tools">
                       <span className="small muted">
-                        {shownNote.mode === "full"
+                        {shownArticle
+                          ? shownNote.status === "partial" ? "文稿未完成" : "完整文稿"
+                          : shownNote.mode === "full"
                           ? `完整文档 · ${shownNote.sectionCount || 0} 段`
                           : shownNote.status === "partial"
                             ? "未完成内容"
@@ -1882,17 +1964,24 @@ export default function Home() {
                       </span>
                       <button className="text-button" onClick={copyNote}>
                         {copied ? <Check size={15} /> : <Copy size={15} />}
-                        {copied ? "已复制" : "复制笔记"}
+                        {copied ? "已复制" : shownArticle ? "复制文稿" : "复制笔记"}
                       </button>
                       <button
                         className="text-button"
                         onClick={() => exportNote()}
                       >
                         <ArrowDownToLine size={15} />
-                        {shownNote.mode === "full"
+                        {shownArticle
+                          ? "导出文稿"
+                          : shownNote.mode === "full"
                           ? "导出文档（附原文）"
                           : "导出 Markdown"}
                       </button>
+                      {shownArticle && (
+                        <button className="text-button" onClick={() => exportNote(active, shownNote, true)}>
+                          导出文稿（附原文）
+                        </button>
+                      )}
                     </div>
                   )}
                   <section className="personal-memo">
@@ -2255,15 +2344,15 @@ export default function Home() {
                       return;
                     }
                     setSourceOpen(false);
-                    if (noteMode === "full") generateFull(canResumeFull);
+                    if (longForm) generateFull(canResumeFull);
                     else generate();
                   }}
                 >
                   <Sparkles size={16} />
-                  {noteMode === "full"
+                  {longForm
                     ? canResumeFull
-                      ? "继续整理完整文档"
-                      : "生成完整文档"
+                      ? `继续整理${outputName}`
+                      : `生成${outputName}`
                     : totalCharacters > 20000
                       ? "整理所选片段"
                       : "生成学习笔记"}
@@ -2286,18 +2375,18 @@ export default function Home() {
                 </p>
               </details>
             </section>
-            {shownNote && (
+            {(shownNote || sourceEvidence) && (
               <section className="tool-section">
                 <h3>当前内容的依据</h3>
                 <p>
-                  {shownNote.source ||
+                  {shownNote?.source || sourceEvidence?.label ||
                     active.fullJob?.source.label ||
                     "未取得来源"}{" "}
-                  · {active.fullJob ? `原文已读取，正文完成 ${fullSections.length}/${active.fullJob.totalSections} 段` : coverage(shownNote.evidence)}
+                  · {active.fullJob ? `原文已读取，正文完成 ${fullSections.length}/${active.fullJob.totalSections} 段` : coverage(sourceEvidence)}
                 </p>
-                {(shownNote.evidence || active.fullJob?.source)?.limitation && (
+                {sourceEvidence?.limitation && (
                   <p className="notice">
-                    {(shownNote.evidence || active.fullJob?.source)?.limitation}
+                    {sourceEvidence.limitation}
                   </p>
                 )}
                 <p className="small muted">
@@ -2307,7 +2396,7 @@ export default function Home() {
                   <>
                     <div className="source-summary">
                       <span>
-                        {noteMode === "full" || shownNote.mode === "full"
+                        {longForm || shownNote?.mode === "full" || shownArticle
                           ? "完整字幕原文"
                           : "本次整理的原文"}
                       </span>
